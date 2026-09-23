@@ -49,7 +49,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
-SCRIPT_VERSION=12
+SCRIPT_VERSION=13
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -831,10 +831,12 @@ if [[ -n $SUB_DOMAIN ]]; then
     SUB_CERT=/root/cert/$SUB_DOMAIN/fullchain.pem
     SUB_KEY=/root/cert/$SUB_DOMAIN/privkey.pem
     mkdir -p "/root/cert/$SUB_DOMAIN"
+    # reloadcmd не должен падать: acme.sh считает его ошибку ошибкой установки,
+    # а веб-интерфейса при первом запуске ещё нет
     $ACME --install-cert -d "$SUB_DOMAIN" --ecc \
         --fullchain-file "$SUB_CERT" --key-file "$SUB_KEY" \
-        --reloadcmd "systemctl restart x-ui; systemctl try-restart l2tp-exit-web" >/dev/null 2>&1 \
-        || die "Не удалось установить сертификат (см. /tmp/acme.log)"
+        --reloadcmd "systemctl restart x-ui; systemctl try-restart l2tp-exit-web || true" >>/tmp/acme.log 2>&1 \
+        || { tail -20 /tmp/acme.log >&2; die "Не удалось установить сертификат (лог выше и в /tmp/acme.log)"; }
     chmod 600 "$SUB_KEY"
     $XUI_DIR/x-ui cert -webCert "$SUB_CERT" -webCertKey "$SUB_KEY" >/dev/null \
         || warn "Не удалось включить HTTPS для панели"
