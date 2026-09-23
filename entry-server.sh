@@ -43,7 +43,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
-SCRIPT_VERSION=9
+SCRIPT_VERSION=10
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -303,6 +303,13 @@ chmod 600 /etc/swanctl/conf.d/$CONN.conf
 [[ -f /etc/xl2tpd/xl2tpd.conf && ! -f /etc/xl2tpd/xl2tpd.conf.orig ]] \
     && cp /etc/xl2tpd/xl2tpd.conf /etc/xl2tpd/xl2tpd.conf.orig
 {
+# listen-addr обязателен: на 0.0.0.0 адрес отправителя ответов выбирается по
+# маршрутизации, и ответы L2TP-клиентам уходили бы в туннель с чужим адресом
+cat <<EOF
+[global]
+listen-addr = $WAN_IP
+
+EOF
 if [[ $L2TP_SERVER == 1 ]]; then
 cat <<EOF
 [lns default]
