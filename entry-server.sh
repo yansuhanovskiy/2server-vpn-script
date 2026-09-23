@@ -14,7 +14,10 @@
 #
 # Необязательные:
 #   INBOUND_PORT=443                 порт VLESS Reality
-#   REALITY_SNI=www.microsoft.com    домен для маскировки Reality
+#   REALITY_SNI=firstvds.ru          домен для маскировки Reality. Лучше всего сайт из
+#                                    той же сети (AS), что и сервер: для FirstVDS это
+#                                    firstvds.ru. Для другого хостинга подберите свой.
+#   TRANSPORT=xhttp                  xhttp (стабильнее через ТСПУ) | tcp (Vision)
 #   INBOUND_REMARK=vless-reality     имя inbound в панели
 #   XUI_USERNAME / XUI_PASSWORD      логин/пароль панели (иначе случайные)
 #   XUI_PANEL_PORT                   порт панели (иначе случайный)
@@ -34,7 +37,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
-SCRIPT_VERSION=6
+SCRIPT_VERSION=7
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -64,7 +67,9 @@ for v in "$VPN_IPSEC_PSK" "$VPN_USER" "$VPN_PASSWORD"; do
 done
 
 INBOUND_PORT=${INBOUND_PORT:-443}
-REALITY_SNI=${REALITY_SNI:-www.microsoft.com}
+REALITY_SNI=${REALITY_SNI:-firstvds.ru}
+TRANSPORT=${TRANSPORT:-xhttp}
+[[ $TRANSPORT == xhttp || $TRANSPORT == tcp ]] || die "TRANSPORT должен быть xhttp или tcp"
 INBOUND_REMARK=${INBOUND_REMARK:-vless-reality}
 XUI_SSL_MODE=${XUI_SSL_MODE:-none}
 KILL_SWITCH=${KILL_SWITCH:-1}
@@ -575,14 +580,29 @@ jq -e '.success' >/dev/null <<<"$list" || die "API 3x-ui не отвечает: 
 existing=$(jq -c --arg r "$INBOUND_REMARK" '[.obj[]? | select(.remark==$r)][0] // empty' <<<"$list")
 
 if [[ -n $existing ]]; then
+    ex_net=$(jq -r "$JQ_DEFS"' .streamSettings | j | .network' <<<"$existing")
+    ex_sni=$(jq -r "$JQ_DEFS"' .streamSettings | j | .realitySettings.serverNames[0]' <<<"$existing")
+    if [[ $ex_net != "$TRANSPORT" || $ex_sni != "$REALITY_SNI" ]]; then
+        log "Inbound '$INBOUND_REMARK' ($ex_net, SNI $ex_sni) пересоздаю как $TRANSPORT, SNI $REALITY_SNI — ссылка изменится."
+        old_port=$(jq -r '.port' <<<"$existing")
+        api POST "/panel/api/inbounds/del/$(jq -r '.id' <<<"$existing")" >/dev/null
+        existing=""
+        for _ in $(seq 1 20); do
+            ss -Hltn "sport = :$old_port" | grep -q . || break
+            sleep 1
+        done
+    fi
+fi
+
+if [[ -n $existing ]]; then
     log "Inbound '$INBOUND_REMARK' уже существует, использую его."
     CLIENT_ID=$(jq -r "$JQ_DEFS"' .settings | j | .clients[0].id' <<<"$existing")
     INBOUND_PORT=$(jq -r '.port' <<<"$existing")
     PBK=$(jq -r "$JQ_DEFS"' .streamSettings | j | .realitySettings.settings.publicKey' <<<"$existing")
-    REALITY_SNI=$(jq -r "$JQ_DEFS"' .streamSettings | j | .realitySettings.serverNames[0]' <<<"$existing")
     SID=$(jq -r "$JQ_DEFS"' .streamSettings | j | .realitySettings.shortIds[0]' <<<"$existing")
+    XHTTP_PATH=$(jq -r "$JQ_DEFS"' .streamSettings | j | .xhttpSettings.path // "/"' <<<"$existing")
 else
-    log "Создаю inbound VLESS + Reality на порту $INBOUND_PORT ..."
+    log "Создаю inbound VLESS + Reality ($TRANSPORT, SNI $REALITY_SNI) на порту $INBOUND_PORT ..."
     if ss -Hltn "sport = :$INBOUND_PORT" | grep -q .; then
         die "Порт $INBOUND_PORT уже занят. Задайте другой через INBOUND_PORT=..."
     fi
@@ -599,37 +619,56 @@ else
     CLIENT_ID=$(cat /proc/sys/kernel/random/uuid)
     SID=$(openssl rand -hex 8)
     SUB_ID=$(rand 16 | tr 'A-Z' 'a-z')
+    XHTTP_PATH="/$(openssl rand -hex 6)"
+    FLOW=""
+    [[ $TRANSPORT == tcp ]] && FLOW=xtls-rprx-vision
 
     payload=$(jq -nc \
-        --arg remark "$INBOUND_REMARK" --argjson port "$INBOUND_PORT" \
-        --arg id "$CLIENT_ID" --arg email "client-$(rand 6 | tr 'A-Z' 'a-z')" --arg sub "$SUB_ID" \
-        --arg sni "$REALITY_SNI" --arg priv "$PRIV" --arg pbk "$PBK" --arg sid "$SID" '
+        --arg remark "$INBOUND_REMARK" --argjson port "$INBOUND_PORT" --arg net "$TRANSPORT" \
+        --arg id "$CLIENT_ID" --arg flow "$FLOW" --arg email "client-$(rand 6 | tr 'A-Z' 'a-z')" --arg sub "$SUB_ID" \
+        --arg sni "$REALITY_SNI" --arg priv "$PRIV" --arg pbk "$PBK" --arg sid "$SID" --arg path "$XHTTP_PATH" '
     {
       enable: true, remark: $remark, listen: "", port: $port, protocol: "vless",
       expiryTime: 0, total: 0, up: 0, down: 0,
       settings: {
-        clients: [{ id: $id, flow: "xtls-rprx-vision", email: $email, limitIp: 0,
+        clients: [{ id: $id, flow: $flow, email: $email, limitIp: 0,
                     totalGB: 0, expiryTime: 0, enable: true, subId: $sub,
                     comment: "", reset: 0 }],
         decryption: "none", fallbacks: []
       },
-      streamSettings: {
-        network: "tcp", security: "reality", externalProxy: [],
+      streamSettings: ({
+        network: $net, security: "reality", externalProxy: [],
         realitySettings: {
           show: false, xver: 0, target: ($sni + ":443"), serverNames: [$sni],
           privateKey: $priv, minClientVer: "", maxClientVer: "", maxTimediff: 0,
           shortIds: [$sid],
           settings: { publicKey: $pbk, fingerprint: "chrome", serverName: "", spiderX: "/" }
-        },
-        tcpSettings: { acceptProxyProtocol: false, header: { type: "none" } }
-      },
+        }
+      } + (if $net == "xhttp"
+           then { xhttpSettings: { path: $path, host: "", mode: "auto" } }
+           else { tcpSettings: { acceptProxyProtocol: false, header: { type: "none" } } } end)),
       sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false, routeOnly: false }
     }')
     resp=$(api POST /panel/api/inbounds/add "$payload")
     jq -e '.success' >/dev/null <<<"$resp" || die "Не удалось создать inbound: $resp"
+
+    # Битая настройка роняет весь Xray — проверяем, что порт реально слушается
+    listening=0
+    for _ in $(seq 1 20); do
+        ss -Hltn "sport = :$INBOUND_PORT" | grep -q . && { listening=1; break; }
+        sleep 1
+    done
+    if [[ $listening != 1 ]]; then
+        journalctl -u x-ui -n 30 --no-pager | grep -m1 'Failed to start' >&2 || true
+        die "Xray не запустился с новым inbound. Удалите '$INBOUND_REMARK' в панели и пришлите ошибку выше."
+    fi
 fi
 
-VLESS_LINK="vless://${CLIENT_ID}@${PUBLIC_IP}:${INBOUND_PORT}?type=tcp&security=reality&pbk=${PBK}&fp=chrome&sni=${REALITY_SNI}&sid=${SID}&spx=%2F&flow=xtls-rprx-vision#${INBOUND_REMARK}"
+if [[ $TRANSPORT == xhttp ]]; then
+    VLESS_LINK="vless://${CLIENT_ID}@${PUBLIC_IP}:${INBOUND_PORT}?type=xhttp&security=reality&pbk=${PBK}&fp=chrome&sni=${REALITY_SNI}&sid=${SID}&spx=%2F&path=${XHTTP_PATH//\//%2F}&mode=auto&encryption=none#${INBOUND_REMARK}"
+else
+    VLESS_LINK="vless://${CLIENT_ID}@${PUBLIC_IP}:${INBOUND_PORT}?type=tcp&security=reality&pbk=${PBK}&fp=chrome&sni=${REALITY_SNI}&sid=${SID}&spx=%2F&flow=xtls-rprx-vision&encryption=none#${INBOUND_REMARK}"
+fi
 
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
     log "ufw активен — открываю порты $INBOUND_PORT и $XUI_PANEL_PORT"
@@ -654,6 +693,7 @@ summary() {
     echo "================ Клиент VLESS + Reality ================"
     echo "  Адрес    : $PUBLIC_IP:$INBOUND_PORT"
     echo "  UUID     : $CLIENT_ID"
+    echo "  Транспорт: $TRANSPORT"
     echo "  SNI      : $REALITY_SNI"
     echo "  PubKey   : $PBK"
     echo "  ShortId  : $SID"

@@ -21,11 +21,20 @@ port=${hostport##*:}
 query=${rest#*\?}; query=${query%%#*}
 param() { tr '&' '\n' <<<"$query" | awk -F= -v k="$1" '$1==k{print $2; exit}'; }
 pbk=$(param pbk); sni=$(param sni); sid=$(param sid); flow=$(param flow); fp=$(param fp)
+net=$(param type); net=${net:-tcp}
+path=$(param path); path=${path//%2F//}; path=${path:-/}
+mode=$(param mode); mode=${mode:-auto}
 
-echo "uuid=$uuid port=$port sni=$sni sid=$sid flow=$flow pbk=$pbk"
+echo "net=$net uuid=$uuid port=$port sni=$sni sid=$sid flow=$flow pbk=$pbk path=$path"
+if [[ $net == xhttp ]]; then
+    transport="\"xhttpSettings\": {\"path\": \"$path\", \"mode\": \"$mode\"},"
+else
+    transport=""
+fi
 
 tmp=$(mktemp -d)
-trap 'kill $pid 2>/dev/null; rm -rf "$tmp"' EXIT
+pid=""
+trap 'kill ${pid:-} 2>/dev/null; rm -rf "$tmp"' EXIT
 cat > "$tmp/c.json" <<EOF
 {
   "log": {"loglevel": "warning"},
@@ -34,7 +43,7 @@ cat > "$tmp/c.json" <<EOF
     "protocol": "vless",
     "settings": {"vnext": [{"address": "127.0.0.1", "port": $port,
       "users": [{"id": "$uuid", "encryption": "none", "flow": "$flow"}]}]},
-    "streamSettings": {"network": "tcp", "security": "reality",
+    "streamSettings": {"network": "$net", "security": "reality", $transport
       "realitySettings": {"serverName": "$sni", "publicKey": "$pbk", "shortId": "$sid",
                           "fingerprint": "${fp:-chrome}", "spiderX": "/"}}
   }]

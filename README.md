@@ -30,10 +30,14 @@ VPN_SERVER_IP='1.2.3.4' VPN_IPSEC_PSK='...' VPN_USER='relay' VPN_PASSWORD='...' 
 1. Настраивает L2TP/IPsec клиент (strongSwan swanctl + xl2tpd) и сервис `l2tp-exit`, который следит за туннелем и переподключает его.
 2. Настраивает policy routing: весь исходящий трафик идёт в туннель, а ответы на входящие
    соединения (SSH, клиенты, панель) уходят напрямую, поэтому SSH не отваливается.
-3. Ставит 3x-ui в неинтерактивном режиме, создаёт inbound VLESS + Reality (порт 443) и печатает
+3. Ставит 3x-ui в неинтерактивном режиме, создаёт inbound VLESS + Reality поверх XHTTP (порт 443) и печатает
    URL панели, логин и пароль, ссылку `vless://` и QR-код. Всё это сохраняется в `/root/vpn-access.txt`.
 
-Необязательные переменные: `INBOUND_PORT`, `REALITY_SNI`, `XUI_USERNAME`, `XUI_PASSWORD`,
+**SNI (`REALITY_SNI`)** по умолчанию `firstvds.ru`, потому что лучше всего работает домен из той же сети,
+что и сервер: ТСПУ режет Reality с «чужим» SNI вроде www.microsoft.com на российском IP хостинга.
+Если хостинг другой, подберите сайт из его сети с поддержкой TLS 1.3 и h2.
+
+Необязательные переменные: `INBOUND_PORT`, `REALITY_SNI`, `TRANSPORT` (`xhttp`/`tcp`), `XUI_USERNAME`, `XUI_PASSWORD`,
 `XUI_PANEL_PORT`, `XUI_WEB_BASE_PATH`, `XUI_SSL_MODE` (`none`/`ip`/`domain`), `KILL_SWITCH`,
 `DISABLE_IPV6`, `SET_DNS`. Их описание есть в шапке скрипта.
 
@@ -50,3 +54,16 @@ l2tp-exit status                              # SA, ppp, правила, вне�
 journalctl -u l2tp-exit -f                    # лог переподключений
 l2tp-exit down && systemctl disable l2tp-exit # выключить туннель и вернуть маршрутизацию
 ```
+
+### Диагностика
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yansuhanovskiy/2server-vpn-script/main/check-client.sh)
+```
+Эта команда проверяет ссылку из `/root/vpn-access.txt` прямо на сервере: временный Xray-клиент подключается
+через неё и печатает внешний IP. Если проверка прошла, а на телефоне не работает, проблема в сети клиента (DPI).
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yansuhanovskiy/2server-vpn-script/main/test-variants.sh)
+```
+Этот скрипт создаёт тестовые inbound'ы с разными настройками (TCP+Vision, XHTTP, VLESS encryption) на портах
+8443/9443/10443. Так можно подобрать вариант, который проходит через DPI провайдера.
