@@ -43,7 +43,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
-SCRIPT_VERSION=8
+SCRIPT_VERSION=9
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -225,6 +225,9 @@ umask 077
 # иначе charon не смог бы выбрать нужный PSK.
 if [[ $L2TP_SERVER == 1 ]]; then
     UPLINK_SECRET_ID="id-uplink = $VPN_SERVER_IP"
+    # Явный id сервера №2 (hwdsl2 представляется leftid=<публичный IP>): без него
+    # remote id = %any, оба PSK подходят одинаково и charon может взять чужой
+    UPLINK_REMOTE_ID="id = $VPN_SERVER_IP"
     SERVER_CONN="
     l2tp-server {
         version = 1
@@ -255,6 +258,7 @@ if [[ $L2TP_SERVER == 1 ]]; then
     }"
 else
     UPLINK_SECRET_ID=""
+    UPLINK_REMOTE_ID=""
     SERVER_CONN=""
     SERVER_SECRET=""
 fi
@@ -272,6 +276,7 @@ connections {
         }
         remote {
             auth = psk
+            $UPLINK_REMOTE_ID
         }
         children {
             $CONN {
