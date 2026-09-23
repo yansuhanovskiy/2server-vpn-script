@@ -66,9 +66,8 @@ add() {
         clients: [{ id: $id, flow: $flow, email: $email, limitIp: 0, totalGB: 0,
                     expiryTime: 0, enable: true, comment: "", reset: 0 }],
         decryption: (if $dec == "" then "none" else $dec end),
-        encryption: (if $encr == "" then "none" else $encr end),
-        fallbacks: []
-      },
+        encryption: (if $encr == "" then "none" else $encr end)
+      } + (if $dec == "" then { fallbacks: [] } else {} end),
       streamSettings: ({
         network: $net, security: "reality", externalProxy: [],
         realitySettings: {
@@ -85,6 +84,20 @@ add() {
     resp=$(api POST /panel/api/inbounds/add "$payload")
     if ! jq -e '.success' >/dev/null <<<"$resp"; then
         echo "[$remark] не создан: $resp" >&2
+        return
+    fi
+    # Одна битая настройка роняет весь Xray (и основной inbound) — проверяем сразу
+    local ok=0 i
+    for i in $(seq 1 20); do
+        if ss -Hltn "sport = :443" | grep -q . && ss -Hltn "sport = :$port" | grep -q .; then ok=1; break; fi
+        sleep 1
+    done
+    if [[ $ok != 1 ]]; then
+        echo "[$remark] Xray не принял конфиг, удаляю:" >&2
+        journalctl -u x-ui -n 30 --no-pager | grep -m1 'Failed to start' >&2 || true
+        api POST "/panel/api/inbounds/del/$(jq -r '.obj.id' <<<"$resp")" >/dev/null
+        systemctl restart x-ui
+        sleep 5
         return
     fi
     local q="type=$net&security=reality&pbk=$PBK&fp=chrome&sni=$SNI&sid=$sid&spx=%2F"
