@@ -49,7 +49,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
-SCRIPT_VERSION=13
+SCRIPT_VERSION=14-multi
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -148,6 +148,8 @@ for d in $DNS_SERVERS; do
     [[ $d =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "DNS_SERVERS: '$d' — не IPv4-адрес"
 done
 WEBUI=${WEBUI:-1}
+MAIN_TITLE=${MAIN_TITLE:-$(saved MAIN_TITLE)}; MAIN_TITLE=${MAIN_TITLE:-Основной}
+[[ $MAIN_TITLE =~ [\'\"\\] ]] && die "MAIN_TITLE: без кавычек"
 XUI_VERSION=${XUI_VERSION:-v3.8.5}
 L2TP_SERVER=${L2TP_SERVER:-1}
 L2TP_NET=192.168.50
@@ -211,6 +213,8 @@ for u in https://ipv4.icanhazip.com https://api4.ipify.org https://4.ident.me; d
 done
 [[ -n $PUBLIC_IP ]] || { warn "Публичный IP не определён, использую $WAN_IP"; PUBLIC_IP=$WAN_IP; }
 log "Интерфейс: $WAN_DEV, локальный IP: $WAN_IP, публичный IP: $PUBLIC_IP"
+# Адрес для ссылок доп. выходов: домен, если есть, иначе IP
+ENTRY_HOST=${SUB_DOMAIN:-$(saved ENTRY_HOST)}; ENTRY_HOST=${ENTRY_HOST:-$PUBLIC_IP}
 
 # ---------------------------------------------------------------------------
 # Пакеты
@@ -227,7 +231,7 @@ if dpkg -s strongswan-starter >/dev/null 2>&1; then
 fi
 apt-get install -y -qq \
     charon-systemd strongswan-swanctl libstrongswan-standard-plugins \
-    xl2tpd ppp iproute2 iptables curl jq openssl qrencode ca-certificates >/dev/null
+    xl2tpd ppp iproute2 iptables curl jq openssl qrencode ca-certificates python3 >/dev/null
 
 SWAN_UNIT=""
 for u in strongswan.service strongswan-swanctl.service; do
@@ -243,18 +247,18 @@ log "Настраиваю IPsec/L2TP клиент до $VPN_SERVER_IP ..."
 [[ -f /etc/xl2tpd/xl2tpd.conf && ! -f /etc/xl2tpd/xl2tpd.conf.orig ]] \
     && cp /etc/xl2tpd/xl2tpd.conf /etc/xl2tpd/xl2tpd.conf.orig
 
+# Хуки pppd: маршрут туннеля в его таблицу (основной и доп. выходы)
 cat > /etc/ppp/ip-up.d/$CONN <<'EOF'
 #!/bin/sh
-[ "$PPP_IPPARAM" = "l2tp-exit" ] || exit 0
-echo "$PPP_IFACE" > /run/l2tp-exit.iface
-ip route replace default dev "$PPP_IFACE" metric 50 table 202
-ip route flush cache
+case "$PPP_IPPARAM" in
+    l2tp-exit*) exec /usr/local/sbin/l2tp-exit ppp-up "$PPP_IPPARAM" "$PPP_IFACE" ;;
+esac
 EOF
 cat > /etc/ppp/ip-down.d/$CONN <<'EOF'
 #!/bin/sh
-[ "$PPP_IPPARAM" = "l2tp-exit" ] || exit 0
-rm -f /run/l2tp-exit.iface
-ip route del default dev "$PPP_IFACE" metric 50 table 202 2>/dev/null || true
+case "$PPP_IPPARAM" in
+    l2tp-exit*) exec /usr/local/sbin/l2tp-exit ppp-down "$PPP_IPPARAM" "$PPP_IFACE" ;;
+esac
 EOF
 chmod 755 /etc/ppp/ip-up.d/$CONN /etc/ppp/ip-down.d/$CONN
 
@@ -277,16 +281,76 @@ cat > $HELPER <<'HELPER_EOF'
 set -u
 CONN=l2tp-exit
 T_TUN=202
+CONF_DIR=/etc/l2tp-exit
+EXITS_DIR=$CONF_DIR/exits.d
 CTL=/var/run/xl2tpd/l2tp-control
 IFACE_FILE=/run/l2tp-exit.iface
 SIG_FILE=/run/l2tp-exit.routes
-. /etc/l2tp-exit/l2tp-exit.env
+MARK_BASE=8192
+EXIT_PORTS="2053 2083 2087 2443 3443 4443 5443 6443 7443"
+. $CONF_DIR/l2tp-exit.env
 
 log() { echo "l2tp-exit: $*"; }
 
+# ---------------------------------------------------------------- выходы
+#
+# «main» — основной туннель из l2tp-exit.env: через него идут трафик самого
+# сервера, L2TP-клиенты и основной VLESS. Дополнительные выходы лежат в
+# exits.d/<имя>.env; у каждого свой туннель, таблица маршрутизации 202+N
+# и метка пакетов 8192+N, которой Xray помечает трафик «своего» подключения.
+
+exit_names() {
+    local f
+    for f in "$EXITS_DIR"/*.env; do
+        [ -f "$f" ] && basename "$f" .env
+    done
+}
+
+uplinks() { echo main; exit_names; }
+
+# load_uplink <имя>: U_CONN U_IP U_PSK U_USER U_PASS U_TABLE U_MARK U_IFACE_FILE U_TITLE U_PORT
+load_uplink() {
+    if [ "$1" = main ]; then
+        U_CONN=$CONN; U_IP=$VPN_SERVER_IP; U_PSK=$VPN_IPSEC_PSK; U_USER=$VPN_USER; U_PASS=$VPN_PASSWORD
+        U_TABLE=$T_TUN; U_MARK=""; U_IFACE_FILE=$IFACE_FILE; U_TITLE=${MAIN_TITLE:-Основной}; U_PORT=""
+        return 0
+    fi
+    [ -f "$EXITS_DIR/$1.env" ] || return 1
+    local NAME TITLE SERVER_IP PSK USER PASSWORD INDEX PORT
+    . "$EXITS_DIR/$1.env"
+    U_CONN=$CONN-$1; U_IP=$SERVER_IP; U_PSK=$PSK; U_USER=$USER; U_PASS=$PASSWORD
+    U_TABLE=$((T_TUN + INDEX)); U_MARK=$((MARK_BASE + INDEX))
+    U_IFACE_FILE=/run/$CONN-$1.iface; U_TITLE=$TITLE; U_PORT=$PORT
+}
+
+# Имя выхода по имени IPsec/L2TP-соединения (для ip-up/ip-down)
+uplink_by_conn() {
+    case "$1" in
+        "$CONN") echo main ;;
+        "$CONN"-*) echo "${1#"$CONN"-}" ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------- маршрутизация
+#
+# Прямой трафик смотрит в НЕИЗМЕНЁННУЮ таблицу main (исходная маршрутизация
+# сервера), поэтому SSH идёт ровно тем путём, что и до установки.
+#   pref 999   TCP с исходящим портом sshd  -> main
+#   pref 1000  to <IP любого сервера №2>    -> main (IKE/ESP/L2TP идут напрямую)
+#   pref 1001  from <IP на WAN>             -> main (ответы клиентам, SSH, панель)
+#   pref 1002  main без default             -> подсети провайдера, peer ppp и т.д.
+#   pref 1003  fwmark 8192+N                -> 202+N (подключение доп. выхода)
+#   pref 1004  всё остальное                -> 202 (основной туннель)
+# В таблице каждого туннеля при KILL_SWITCH=1 стоит unreachable (трафик выхода
+# никуда не уходит), при KILL_SWITCH=0 у доп. выходов — прямой маршрут через
+# провайдера, а основной просто проваливается в main.
+
+PREFS="999 1000 1001 1002 1003 1004"
+
 flush_rules() {
     local p
-    for p in 999 1000 1001 1002 1003; do
+    for p in $PREFS; do
         while ip -4 rule del pref $p 2>/dev/null; do :; done
     done
 }
@@ -295,15 +359,37 @@ ssh_ports() {
     { sshd -T 2>/dev/null | awk '$1=="port"{print $2}'; echo 22; } | sort -u
 }
 
+wan_line() { ip -4 route show default table main | head -n1; }
+
+wan_dev() {
+    wan_line | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+wan_gw() {
+    wan_line | awk '{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}'
+}
+
+wan_ip() {
+    ip -4 -o addr show dev "$(wan_dev)" scope global | awk '{split($4,a,"/"); print a[1]; exit}'
+}
+
+# Маршрут туннеля в его таблицу (из ip-up и после перестройки правил)
+tunnel_route() {
+    local u=$1 ifc
+    load_uplink "$u" || return 1
+    [ -f "$U_IFACE_FILE" ] || return 0
+    ifc=$(cat "$U_IFACE_FILE")
+    ip link show "$ifc" >/dev/null 2>&1 && ip route replace default dev "$ifc" metric 50 table "$U_TABLE"
+}
+
 apply_routes() {
-    local line dev ips sig ip port
-    line=$(ip -4 route show default table main | head -n1)
-    # Без default в main правила отправили бы ответы SSH в kill switch
-    [ -n "$line" ] || { log "нет default-маршрута в main, правила не применяю"; flush_rules; return 1; }
-    dev=$(awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$line")
+    local dev gw ips sig ip port u ups=""
+    [ -n "$(wan_line)" ] || { log "нет default-маршрута в main, правила не применяю"; flush_rules; return 1; }
+    dev=$(wan_dev); gw=$(wan_gw)
     ips=$(ip -4 -o addr show dev "$dev" scope global | awk '{split($4,a,"/"); print a[1]}' | tr '\n' ' ')
-    sig="$dev|$ips|$(ssh_ports | tr '\n' ' ')|$VPN_SERVER_IP|$KILL_SWITCH"
-    if [ "$sig" = "$(cat $SIG_FILE 2>/dev/null)" ] && ip -4 rule show pref 1003 | grep -q .; then
+    for u in $(uplinks); do load_uplink "$u" && ups="$ups $u:$U_IP:$U_TABLE:$U_MARK"; done
+    sig="$dev|$gw|$ips|$(ssh_ports | tr '\n' ' ')|$ups|$KILL_SWITCH"
+    if [ "$sig" = "$(cat $SIG_FILE 2>/dev/null)" ] && ip -4 rule show pref 1004 | grep -q .; then
         return 0
     fi
     log "применяю маршруты ($sig)"
@@ -311,26 +397,54 @@ apply_routes() {
     for port in $(ssh_ports); do
         ip -4 rule add pref 999 ipproto tcp sport "$port" lookup main 2>/dev/null
     done
-    ip -4 rule add pref 1000 to "$VPN_SERVER_IP" lookup main
+    for u in $(uplinks); do
+        load_uplink "$u" || continue
+        ip -4 rule add pref 1000 to "$U_IP" lookup main
+    done
     for ip in $ips; do
         ip -4 rule add pref 1001 from "$ip" lookup main
     done
     ip -4 rule add pref 1002 lookup main suppress_prefixlength 0
-    ip -4 rule add pref 1003 lookup $T_TUN
-    if [ "$KILL_SWITCH" = "1" ]; then
-        ip route replace unreachable default metric 4000 table $T_TUN
-    else
-        ip route del unreachable default metric 4000 table $T_TUN 2>/dev/null
-    fi
-    # ppp мог подняться раньше, чем появились правила
-    if [ -f $IFACE_FILE ] && ip link show "$(cat $IFACE_FILE)" >/dev/null 2>&1; then
-        ip route replace default dev "$(cat $IFACE_FILE)" metric 50 table $T_TUN
-    fi
+    for u in $(exit_names); do
+        load_uplink "$u" || continue
+        ip -4 rule add pref 1003 fwmark "$U_MARK" lookup "$U_TABLE"
+    done
+    ip -4 rule add pref 1004 lookup $T_TUN
+
+    for u in $(uplinks); do
+        load_uplink "$u" || continue
+        ip route del unreachable default metric 4000 table "$U_TABLE" 2>/dev/null
+        ip route del default metric 4000 table "$U_TABLE" 2>/dev/null
+        if [ "$KILL_SWITCH" = "1" ]; then
+            ip route replace unreachable default metric 4000 table "$U_TABLE"
+        elif [ "$u" != main ]; then
+            # «Работать напрямую»: упавший доп. выход идёт через провайдера,
+            # а не через соседний туннель
+            if [ -n "$gw" ]; then
+                ip route replace default via "$gw" dev "$dev" onlink metric 4000 table "$U_TABLE"
+            else
+                ip route replace default dev "$dev" metric 4000 table "$U_TABLE"
+            fi
+        fi
+        tunnel_route "$u"
+    done
     ip route flush cache
     echo "$sig" > $SIG_FILE
 }
 
-# Правила для L2TP-клиентов этого сервера (идемпотентно, помечены комментарием)
+remove_routes() {
+    local u
+    flush_rules
+    ip route flush table 201 2>/dev/null   # от старых версий скрипта
+    for u in $(uplinks); do
+        load_uplink "$u" && ip route flush table "$U_TABLE" 2>/dev/null
+    done
+    rm -f $SIG_FILE
+    ip route flush cache
+}
+
+# ---------------------------------------------------------------- L2TP-клиенты: NAT и файрвол
+
 fw() {
     local t=$1 c=$2; shift 2
     iptables -w -t "$t" -C "$c" "$@" -m comment --comment l2tp-exit 2>/dev/null \
@@ -369,13 +483,7 @@ apply_fw() {
     if [ "${L2TP_SERVER:-0}" = "1" ]; then fw_rules 2>/dev/null || log "не все правила iptables применились"; else remove_fw; fi
 }
 
-wan_dev() {
-    ip -4 route show default table main | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}'
-}
-
-wan_ip() {
-    ip -4 -o addr show dev "$(wan_dev)" scope global | awk '{split($4,a,"/"); print a[1]; exit}'
-}
+# ---------------------------------------------------------------- конфиги
 
 # DNS: resolv.conf сервера (SET_DNS=1) и ms-dns для L2TP-клиентов
 apply_dns() {
@@ -396,22 +504,86 @@ apply_dns() {
     fi
 }
 
-# Генерирует конфиги strongSwan, xl2tpd и ppp из /etc/l2tp-exit/l2tp-exit.env
+# Генерирует конфиги strongSwan, xl2tpd и ppp для всех выходов
 apply_config() {
-    local wip server_conn="" server_secret="" uplink_secret_id="" uplink_remote_id=""
+    local wip u conns="" secrets="" lacs=""
     wip=$(wan_ip)
     [ -n "$wip" ] || { log "не удалось определить внешний адрес сервера"; return 1; }
     umask 077
 
+    # У каждого выхода свой PSK, поэтому у каждого явно указан id сервера №2
+    # (hwdsl2 представляется leftid=<публичный IP>): без него remote id = %any,
+    # все PSK подходят одинаково и charon может взять чужой.
+    # Алгоритмы подобраны под Libreswan-конфиг hwdsl2 (ike=aes256-sha2;modp2048,...)
+    for u in $(uplinks); do
+        load_uplink "$u" || continue
+        conns="$conns
+    $U_CONN {
+        version = 1
+        remote_addrs = $U_IP
+        proposals = aes256-sha256-modp2048,aes128-sha256-modp2048,aes256-sha1-modp2048,aes128-sha1-modp2048
+        dpd_delay = 30s
+        local {
+            auth = psk
+        }
+        remote {
+            auth = psk
+            id = $U_IP
+        }
+        children {
+            $U_CONN {
+                mode = transport
+                local_ts = dynamic[udp/1701]
+                remote_ts = dynamic[udp/1701]
+                esp_proposals = aes256-sha256,aes128-sha1,aes256-sha1
+                dpd_action = restart
+                start_action = none
+            }
+        }
+    }"
+        secrets="$secrets
+    ike-$U_CONN {
+        id-uplink = $U_IP
+        secret = \"$U_PSK\"
+    }"
+        lacs="$lacs
+[lac $U_CONN]
+lns = $U_IP
+ppp debug = no
+pppoptfile = /etc/ppp/options.$U_CONN
+length bit = yes
+"
+        # Маршруты pppd не трогает (nodefaultroute) — ими управляет этот хелпер.
+        # ipparam позволяет хукам ip-up/ip-down узнать «свой» интерфейс.
+        cat > /etc/ppp/options.$U_CONN <<EOF
+ipcp-accept-local
+ipcp-accept-remote
+refuse-eap
+require-chap
+noccp
+noauth
+mtu 1280
+mru 1280
+noipdefault
+nodefaultroute
+connect-delay 5000
+lcp-echo-interval 20
+lcp-echo-failure 4
+ipparam $U_CONN
+name "$U_USER"
+password "$U_PASS"
+EOF
+    done
+    # Удалённые выходы
+    for f in /etc/ppp/options.$CONN-*; do
+        [ -f "$f" ] || continue
+        [ -f "$EXITS_DIR/${f#/etc/ppp/options.$CONN-}.env" ] || rm -f "$f"
+    done
+
     # L2TP-сервер для своих клиентов живёт в том же charon и том же xl2tpd:
     # второй IPsec-демон (например, Libreswan от hwdsl2) конфликтовал бы за UDP 500/4500.
     if [ "${L2TP_SERVER:-0}" = "1" ]; then
-        # PSK у клиентов свой, поэтому у аплинка явно указан id сервера №2
-        # (hwdsl2 представляется leftid=<публичный IP>): без него remote id = %any,
-        # оба PSK подходят одинаково и charon может взять чужой
-        uplink_secret_id="id-uplink = $VPN_SERVER_IP"
-        uplink_remote_id="id = $VPN_SERVER_IP"
-        server_conn="
+        conns="$conns
     l2tp-server {
         version = 1
         remote_addrs = %any
@@ -435,47 +607,13 @@ apply_config() {
             }
         }
     }"
-        server_secret="
+        secrets="$secrets
     ike-l2tp-server {
         secret = \"$L2TP_PSK\"
     }"
     fi
 
-    # Алгоритмы подобраны под Libreswan-конфиг hwdsl2 (ike=aes256-sha2;modp2048,...)
-    cat > /etc/swanctl/conf.d/$CONN.conf <<EOF
-connections {
-    $CONN {
-        version = 1
-        remote_addrs = $VPN_SERVER_IP
-        proposals = aes256-sha256-modp2048,aes128-sha256-modp2048,aes256-sha1-modp2048,aes128-sha1-modp2048
-        dpd_delay = 30s
-        local {
-            auth = psk
-        }
-        remote {
-            auth = psk
-            $uplink_remote_id
-        }
-        children {
-            $CONN {
-                mode = transport
-                local_ts = dynamic[udp/1701]
-                remote_ts = dynamic[udp/1701]
-                esp_proposals = aes256-sha256,aes128-sha1,aes256-sha1
-                dpd_action = restart
-                start_action = none
-            }
-        }
-    }$server_conn
-}
-
-secrets {
-    ike-$CONN {
-        $uplink_secret_id
-        secret = "$VPN_IPSEC_PSK"
-    }$server_secret
-}
-EOF
+    printf 'connections {%s\n}\n\nsecrets {%s\n}\n' "$conns" "$secrets" > /etc/swanctl/conf.d/$CONN.conf
 
     # listen-addr обязателен: на 0.0.0.0 адрес отправителя ответов выбирается по
     # маршрутизации, и ответы L2TP-клиентам уходили бы в туннель с чужим адресом
@@ -492,16 +630,9 @@ require authentication = yes
 name = l2tpd
 pppoptfile = /etc/ppp/options.l2tp-server
 length bit = yes
-
 EOF
         fi
-        cat <<EOF
-[lac $CONN]
-lns = $VPN_SERVER_IP
-ppp debug = no
-pppoptfile = /etc/ppp/options.$CONN
-length bit = yes
-EOF
+        printf '%s' "$lacs"
     } > /etc/xl2tpd/xl2tpd.conf
 
     touch /etc/ppp/chap-secrets
@@ -525,32 +656,103 @@ EOF
         printf '"%s" l2tpd "%s" * # l2tp-exit-server\n' "$L2TP_USER" "$L2TP_PASSWORD" >> /etc/ppp/chap-secrets
     fi
     chmod 600 /etc/ppp/chap-secrets /etc/swanctl/conf.d/$CONN.conf
-
-    # Маршруты pppd не трогает (nodefaultroute) — ими управляет этот хелпер.
-    # ipparam позволяет хукам ip-up/ip-down узнать «свой» интерфейс.
-    cat > /etc/ppp/options.$CONN <<EOF
-ipcp-accept-local
-ipcp-accept-remote
-refuse-eap
-require-chap
-noccp
-noauth
-mtu 1280
-mru 1280
-noipdefault
-nodefaultroute
-connect-delay 5000
-lcp-echo-interval 20
-lcp-echo-failure 4
-ipparam $CONN
-name "$VPN_USER"
-password "$VPN_PASSWORD"
-EOF
     umask 022
     apply_dns
 }
 
-# Применить изменённые настройки на работающем сервере (зовёт веб-интерфейс)
+# ---------------------------------------------------------------- туннели
+
+ctl() {
+    [ -p $CTL ] || return 1
+    timeout 5 sh -c "echo '$1' > $CTL"
+}
+
+is_up() {
+    local ifc
+    load_uplink "$1" || return 1
+    [ -f "$U_IFACE_FILE" ] || return 1
+    ifc=$(cat "$U_IFACE_FILE")
+    ip -4 addr show dev "$ifc" 2>/dev/null | grep -q 'inet '
+}
+
+connect() {
+    local u=$1 i
+    load_uplink "$u" || return 1
+    if ! swanctl --list-sas --ike "$U_CONN" 2>/dev/null | grep -q INSTALLED; then
+        swanctl --terminate --ike "$U_CONN" >/dev/null 2>&1
+        swanctl --initiate --child "$U_CONN" --timeout 30 >/dev/null 2>&1 \
+            || { log "[$u] IPsec не поднялся"; return 1; }
+        log "[$u] IPsec SA установлена"
+    fi
+    ctl "d $U_CONN"
+    sleep 1
+    ctl "c $U_CONN" || { log "[$u] xl2tpd недоступен"; return 1; }
+    for i in $(seq 1 30); do
+        is_up "$u" && { log "[$u] PPP поднят: $(cat "$U_IFACE_FILE")"; return 0; }
+        sleep 1
+    done
+    log "[$u] PPP не поднялся"
+    return 1
+}
+
+# Подключение каждого выхода — в отдельном фоновом процессе: мёртвый выход
+# не должен задерживать переподключение остальных
+watch() {
+    local u pidf fails
+    swanctl --load-all --noprompt >/dev/null 2>&1
+    rm -f /run/l2tp-exit-connect.*.pid
+    while :; do
+        apply_routes
+        apply_fw
+        for u in $(uplinks); do
+            is_up "$u" && { rm -f "/run/l2tp-exit-fails.$u"; continue; }
+            pidf=/run/l2tp-exit-connect.$u.pid
+            if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then continue; fi
+            log "[$u] туннель не активен, подключаюсь"
+            (
+                if connect "$u"; then
+                    rm -f "/run/l2tp-exit-fails.$u"
+                else
+                    fails=$(( $(cat "/run/l2tp-exit-fails.$u" 2>/dev/null || echo 0) + 1 ))
+                    echo $fails > "/run/l2tp-exit-fails.$u"
+                    # Перезапуск служб рвёт все туннели — только если долго лежит основной
+                    if [ "$u" = main ] && [ $fails -ge 3 ]; then
+                        log "перезапускаю $SWAN_UNIT и xl2tpd"
+                        systemctl restart "$SWAN_UNIT" xl2tpd
+                        sleep 3
+                        swanctl --load-all --noprompt >/dev/null 2>&1
+                        rm -f "/run/l2tp-exit-fails.$u"
+                    fi
+                fi
+            ) &
+            echo $! > "$pidf"
+        done
+        sleep 15
+    done
+}
+
+# Внешний IP через выход: соединение с меткой выхода, как у трафика Xray
+exit_ip() {
+    load_uplink "$1" || return 1
+    python3 - "${U_MARK:-0}" <<'PY' 2>/dev/null
+import socket, sys
+mark = int(sys.argv[1])
+s = socket.socket()
+if mark:
+    s.setsockopt(socket.SOL_SOCKET, 36, mark)  # SO_MARK
+s.settimeout(6)
+s.connect((socket.gethostbyname('ipv4.icanhazip.com'), 80))
+s.sendall(b'GET / HTTP/1.0\r\nHost: ipv4.icanhazip.com\r\n\r\n')
+data = b''
+while True:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    data += chunk
+print(data.split(b'\r\n\r\n', 1)[-1].decode().strip())
+PY
+}
+
 apply_all() {
     apply_config || return 1
     swanctl --load-all --noprompt >/dev/null 2>&1
@@ -558,86 +760,244 @@ apply_all() {
 }
 
 reconnect() {
-    ctl "d $CONN"
-    swanctl --terminate --ike $CONN >/dev/null 2>&1
+    local u
+    for u in $(uplinks); do
+        load_uplink "$u" || continue
+        ctl "d $U_CONN"
+        swanctl --terminate --ike "$U_CONN" >/dev/null 2>&1
+    done
+    # Соединения удалённых выходов
+    swanctl --list-sas 2>/dev/null | awk -F: '/^l2tp-exit-[^:]*: #/{print $1}' | sort -u | while read -r c; do
+        [ -f "$EXITS_DIR/${c#"$CONN"-}.env" ] || swanctl --terminate --ike "$c" >/dev/null 2>&1
+    done
     systemctl restart xl2tpd
     rm -f $SIG_FILE
     systemctl restart l2tp-exit
 }
 
-remove_routes() {
-    flush_rules
-    ip route flush table 201 2>/dev/null   # от старых версий скрипта
-    ip route flush table $T_TUN 2>/dev/null
-    rm -f $SIG_FILE
-    ip route flush cache
+# ---------------------------------------------------------------- доп. выходы: 3x-ui
+
+xui_api() {
+    local method=$1 path=$2 data=${3:-} ctype=${4:-application/json}
+    local args=(-sSk --max-time 20 -X "$method" -H "Authorization: Bearer $XUI_TOKEN" -H 'Accept: application/json')
+    [ -n "$data" ] && args+=(-H "Content-Type: $ctype" --data "$data")
+    curl "${args[@]}" "$XUI_BASE$path"
 }
 
-is_up() {
-    local ifc
-    [ -f $IFACE_FILE ] || return 1
-    ifc=$(cat $IFACE_FILE)
-    ip -4 addr show dev "$ifc" 2>/dev/null | grep -q 'inet '
+xui_init() {
+    local port path scheme=http
+    [ -f $CONF_DIR/xui.env ] || { log "нет $CONF_DIR/xui.env — 3x-ui не настроен"; return 1; }
+    port=$(. $CONF_DIR/xui.env; echo "$XUI_PANEL_PORT")
+    path=$(. $CONF_DIR/xui.env; echo "$XUI_WEB_BASE_PATH")
+    /usr/local/x-ui/x-ui setting -getCert true 2>/dev/null | grep 'cert:' | awk -F': ' '{print $2}' \
+        | grep -q '[^[:space:]]' && scheme=https
+    XUI_BASE="$scheme://127.0.0.1:$port/$path"
+    XUI_TOKEN=$(/usr/local/x-ui/x-ui setting -getApiToken 2>/dev/null | grep -Eo 'apiToken: .+' | awk '{print $2}')
+    [ -n "$XUI_TOKEN" ] || { log "не удалось получить API-токен 3x-ui"; return 1; }
 }
 
-ctl() {
-    [ -p $CTL ] || return 1
-    timeout 5 sh -c "echo '$1' > $CTL"
-}
+JQ_J='def j: if type=="string" then (fromjson? // {}) else (. // {}) end;'
 
-connect() {
-    local i
-    if ! swanctl --list-sas --ike $CONN 2>/dev/null | grep -q INSTALLED; then
-        swanctl --terminate --ike $CONN >/dev/null 2>&1
-        swanctl --initiate --child $CONN --timeout 30 >/dev/null 2>&1 \
-            || { log "IPsec не поднялся"; return 1; }
-        log "IPsec SA установлена"
-    fi
-    ctl "d $CONN"
-    sleep 1
-    ctl "c $CONN" || { log "xl2tpd недоступен"; return 1; }
-    for i in $(seq 1 30); do
-        is_up && { log "PPP поднят: $(cat $IFACE_FILE)"; return 0; }
-        sleep 1
-    done
-    log "PPP не поднялся"
-    return 1
-}
+# Для каждого выхода — копия основного inbound на своём порту (inbound
+# «exit-<имя>», тот же subId клиента: одна подписка на все выходы), плюс в
+# шаблоне Xray исходящий канал с меткой выхода и правило «inbound → канал».
+xray_sync() {
+    local list main u remark have payload resp tmpl new exits="[]" tag
+    xui_init || return 1
+    list=$(xui_api GET /panel/api/inbounds/list)
+    echo "$list" | jq -e '.success' >/dev/null 2>&1 || { log "API 3x-ui не отвечает"; return 1; }
+    main=$(echo "$list" | jq -c --arg r "${MAIN_INBOUND_REMARK:-vless-reality}" '[.obj[]? | select(.remark==$r)][0] // empty')
+    [ -n "$main" ] || { log "нет основного inbound ${MAIN_INBOUND_REMARK:-vless-reality}"; return 1; }
 
-watch() {
-    local fails=0
-    swanctl --load-all --noprompt >/dev/null 2>&1
-    while :; do
-        apply_routes
-        apply_fw
-        if is_up; then
-            fails=0
-        else
-            log "туннель не активен, подключаюсь"
-            if ! connect; then
-                fails=$((fails + 1))
-                if [ $fails -ge 3 ]; then
-                    log "перезапускаю $SWAN_UNIT и xl2tpd"
-                    systemctl restart "$SWAN_UNIT" xl2tpd
-                    sleep 3
-                    swanctl --load-all --noprompt >/dev/null 2>&1
-                    fails=0
-                fi
-            fi
+    for u in $(exit_names); do
+        load_uplink "$u" || continue
+        remark="exit-$u"
+        have=$(echo "$list" | jq -r --arg r "$remark" '[.obj[]? | select(.remark==$r)][0].port // empty')
+        if [ -n "$have" ] && [ "$have" != "$U_PORT" ]; then
+            xui_api POST "/panel/api/inbounds/del/$(echo "$list" | jq -r --arg r "$remark" '[.obj[]? | select(.remark==$r)][0].id')" >/dev/null
+            have=""
         fi
-        sleep 15
+        if [ -z "$have" ]; then
+            payload=$(echo "$main" | jq -c --arg r "$remark" --argjson port "$U_PORT" \
+                --arg id "$(cat /proc/sys/kernel/random/uuid)" --arg email "$remark-$(openssl rand -hex 3)" \
+                --arg path "/$(openssl rand -hex 6)" "$JQ_J"'
+                {enable: true, remark: $r, listen: "", port: $port, protocol: .protocol,
+                 expiryTime: 0, total: 0, up: 0, down: 0,
+                 settings: (.settings | j | .clients = [(.clients[0] // {}) + {id: $id, email: $email}]
+                            | .clients[0] |= del(.created_at, .updated_at)),
+                 streamSettings: (.streamSettings | j
+                            | if .network == "xhttp" then .xhttpSettings.path = $path else . end),
+                 sniffing: (.sniffing | j)}')
+            resp=$(xui_api POST /panel/api/inbounds/add "$payload")
+            echo "$resp" | jq -e '.success' >/dev/null 2>&1 || { log "[$u] не удалось создать inbound: $resp"; return 1; }
+            log "[$u] создан inbound $remark на порту $U_PORT"
+        fi
+    done
+    # inbound'ы удалённых выходов
+    for id in $(echo "$list" | jq -r '.obj[]? | select(.remark|startswith("exit-")) | "\(.id) \(.remark)"' \
+        | while read -r id r; do [ -f "$EXITS_DIR/${r#exit-}.env" ] || echo "$id"; done); do
+        xui_api POST "/panel/api/inbounds/del/$id" >/dev/null
+    done
+
+    list=$(xui_api GET /panel/api/inbounds/list)
+    for u in $(exit_names); do
+        load_uplink "$u" || continue
+        tag=$(echo "$list" | jq -r --arg r "exit-$u" '[.obj[]? | select(.remark==$r)][0].tag // empty')
+        [ -n "$tag" ] || { log "[$u] не найден тег inbound"; return 1; }
+        exits=$(echo "$exits" | jq -c --arg n "$u" --arg t "$tag" --argjson m "$U_MARK" '. + [{name: $n, tag: $t, mark: $m}]')
+    done
+
+    tmpl=$(xui_api POST /panel/api/xray/ | jq -r '.obj.xraySetting // empty')
+    [ -n "$tmpl" ] || { log "не удалось прочитать шаблон Xray"; return 1; }
+    # Наши каналы добавляются в конец (первый outbound — канал по умолчанию),
+    # правила — тоже в конец, после блокировок 3x-ui (private IP, bittorrent)
+    new=$(echo "$tmpl" | jq -c --argjson ex "$exits" '
+        .outbounds = ([.outbounds[]? | select((.tag // "") | startswith("exit-") | not)]
+                      + [$ex[] | {tag: ("exit-" + .name), protocol: "freedom",
+                                  settings: {domainStrategy: "AsIs"},
+                                  streamSettings: {sockopt: {mark: .mark}}}])
+        | .routing.rules = ([.routing.rules[]? | select((.ruleTag // "") | startswith("l2tp-exit-") | not)]
+                      + [$ex[] | {type: "field", ruleTag: ("l2tp-exit-" + .name),
+                                  inboundTag: [.tag], outboundTag: ("exit-" + .name)}])')
+    if [ "$(echo "$tmpl" | jq -S -c .)" != "$(echo "$new" | jq -S -c .)" ]; then
+        resp=$(curl -sSk --max-time 20 -H "Authorization: Bearer $XUI_TOKEN" \
+            --data-urlencode "xraySetting=$new" "$XUI_BASE/panel/api/xray/update")
+        echo "$resp" | jq -e '.success' >/dev/null 2>&1 || { log "не удалось сохранить шаблон Xray: $resp"; return 1; }
+        xui_api POST /panel/api/server/restartXrayService >/dev/null
+        log "маршруты Xray для выходов обновлены"
+    fi
+}
+
+# Ссылки vless:// доп. выходов (по образцу основного inbound)
+links() {
+    local list u host
+    xui_init || return 1
+    host=${ENTRY_HOST:-$(wan_ip)}
+    list=$(xui_api GET /panel/api/inbounds/list)
+    for u in $(exit_names); do
+        load_uplink "$u" || continue
+        echo "$list" | jq -r --arg r "exit-$u" --arg host "$host" --arg title "$U_TITLE" "$JQ_J"'
+            [.obj[]? | select(.remark==$r)][0] // empty
+            | (.settings | j) as $s | (.streamSettings | j) as $st | $st.realitySettings as $rs
+            | "vless://\($s.clients[0].id)@\($host):\(.port)?type=\($st.network)&security=reality"
+              + "&pbk=\($rs.settings.publicKey)&fp=\($rs.settings.fingerprint // "chrome")"
+              + "&sni=\($rs.serverNames[0])&sid=\($rs.shortIds[0])&spx=%2F"
+              + (if $st.network == "xhttp" then "&path=\($st.xhttpSettings.path | @uri)&mode=auto"
+                 else "&flow=\($s.clients[0].flow // "")" end)
+              + "&encryption=none#\($title | @uri)"'
     done
 }
+
+# ---------------------------------------------------------------- управление выходами
+
+valid() { printf '%s' "$1" | grep -Eq '^[^[:space:]"\\'"'"']{1,128}$'; }
+
+# exit-add <имя> <название> <IP> <PSK> <логин> <пароль> [порт]
+exit_add() {
+    local name=$1 title=$2 ip=$3 psk=$4 user=$5 pass=$6 port=${7:-} idx used p u
+    printf '%s' "$name" | grep -Eq '^[a-z][a-z0-9]{0,11}$' || { log "имя: латиница/цифры, до 12 символов (например de, in)"; return 1; }
+    [ "$name" != main ] || { log "имя main занято основным туннелем"; return 1; }
+    printf '%s' "$ip" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || { log "IP указан неверно"; return 1; }
+    for v in "$psk" "$user" "$pass"; do valid "$v" || { log "логин/пароль/PSK: без пробелов и кавычек"; return 1; }; done
+    printf '%s' "$title" | grep -q "['\"\\\\]" && { log "в названии не должно быть кавычек"; return 1; }
+    [ -n "$title" ] || title=$name
+    for u in $(uplinks); do
+        load_uplink "$u" || continue
+        [ "$U_IP" = "$ip" ] && [ "$u" != "$name" ] && { log "сервер $ip уже подключён как «${u}»"; return 1; }
+        [ "$U_PSK" = "$psk" ] && [ "$u" != "$name" ] && { log "PSK совпадает с выходом «${u}» — нужны разные"; return 1; }
+    done
+    [ "$psk" = "${L2TP_PSK:-}" ] && { log "PSK совпадает с PSK L2TP-клиентов"; return 1; }
+
+    # Повторное добавление того же имени = изменение: индекс и порт сохраняются,
+    # иначе у клиентов перестала бы работать ссылка
+    idx=""; used=" "
+    for u in $(exit_names); do
+        if [ "$u" = "$name" ]; then
+            idx=$(. "$EXITS_DIR/$u.env"; echo "$INDEX")
+            [ -n "$port" ] || port=$(. "$EXITS_DIR/$u.env"; echo "$PORT")
+            continue
+        fi
+        used="$used$(. "$EXITS_DIR/$u.env"; echo "$INDEX $PORT") "
+    done
+    if [ -z "$idx" ]; then
+        for i in 1 2 3 4 5 6 7 8 9; do case "$used" in *" $i "*) ;; *) idx=$i; break ;; esac; done
+        [ -n "$idx" ] || { log "не больше 9 дополнительных выходов"; return 1; }
+    fi
+    if [ -z "$port" ]; then
+        for p in $EXIT_PORTS; do
+            case "$used" in *" $p "*) continue ;; esac
+            ss -Hltn "sport = :$p" | grep -q . && continue
+            port=$p; break
+        done
+    fi
+    printf '%s' "$port" | grep -Eq '^[0-9]{2,5}$' || { log "не нашёл свободный порт, укажите его явно"; return 1; }
+
+    mkdir -p "$EXITS_DIR"; chmod 700 "$EXITS_DIR"
+    umask 077
+    cat > "$EXITS_DIR/$name.env" <<EOF
+NAME='$name'
+TITLE='$title'
+SERVER_IP='$ip'
+PSK='$psk'
+USER='$user'
+PASSWORD='$pass'
+INDEX='$idx'
+PORT='$port'
+EOF
+    umask 022
+    command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active' && ufw allow "$port/tcp" >/dev/null
+    log "выход «${name}» ($title, $ip) сохранён, порт подключения $port"
+    apply_all || return 1
+    xray_sync
+}
+
+exit_del() {
+    [ -f "$EXITS_DIR/$1.env" ] || { log "нет выхода «$1»"; return 1; }
+    load_uplink "$1"
+    rm -f "$EXITS_DIR/$1.env" "/etc/ppp/options.$U_CONN" "$U_IFACE_FILE"
+    ip route flush table "$U_TABLE" 2>/dev/null
+    apply_all
+    xray_sync
+    log "выход «$1» удалён"
+}
+
+# ---------------------------------------------------------------- статус
 
 status() {
-    echo "--- IPsec"; swanctl --list-sas --ike $CONN 2>/dev/null
-    echo "--- PPP";   if is_up; then ip -4 addr show dev "$(cat $IFACE_FILE)"; else echo "down"; fi
-    echo "--- rules"; ip -4 rule show | grep -E '^(999|100[0-3]):'
-    echo "--- table $T_TUN";    ip route show table $T_TUN
+    local u ip
+    for u in $(uplinks); do
+        load_uplink "$u" || continue
+        echo "=== $u ($U_TITLE) → $U_IP${U_PORT:+, подключение на порту $U_PORT}"
+        if swanctl --list-sas --ike "$U_CONN" 2>/dev/null | grep -q INSTALLED; then echo "  IPsec : установлен"; else echo "  IPsec : нет"; fi
+        if is_up "$u"; then
+            ip=$(exit_ip "$u")
+            echo "  PPP   : $(cat "$U_IFACE_FILE"), внешний IP ${ip:-?}"
+        else
+            echo "  PPP   : не поднят"
+        fi
+    done
+    echo "=== правила"; ip -4 rule show | grep -E '^(999|100[0-4]):'
     if [ "${L2TP_SERVER:-0}" = "1" ]; then
-        echo "--- L2TP-клиенты"; swanctl --list-sas --ike l2tp-server 2>/dev/null | grep -E '^l2tp-server' || echo "нет"
+        echo "=== L2TP-клиенты"; swanctl --list-sas --ike l2tp-server 2>/dev/null | grep -E '^l2tp-server' || echo "нет"
     fi
-    echo "--- exit IP"; curl -4 -s --max-time 8 https://ipv4.icanhazip.com || echo "недоступно"
+}
+
+# Статус для веб-интерфейса
+status_json() {
+    local u first=1 up ipsec ip
+    printf '['
+    for u in $(uplinks); do
+        load_uplink "$u" || continue
+        up=false; ipsec=false; ip=""
+        swanctl --list-sas --ike "$U_CONN" 2>/dev/null | grep -q INSTALLED && ipsec=true
+        if is_up "$u"; then up=true; ip=$(exit_ip "$u"); fi
+        [ $first = 1 ] || printf ','
+        first=0
+        jq -nc --arg n "$u" --arg t "$U_TITLE" --arg s "$U_IP" --arg p "$U_PORT" --argjson up $up \
+            --argjson ipsec $ipsec --arg ip "$ip" \
+            '{name: $n, title: $t, server: $s, port: $p, tunnel: $up, ipsec: $ipsec, exit_ip: $ip}'
+    done
+    printf ']\n'
 }
 
 case "${1:-}" in
@@ -648,15 +1008,34 @@ case "${1:-}" in
     reconnect) reconnect ;;
     watch)  watch ;;
     status) status ;;
+    status-json) status_json ;;
+    ppp-up)
+        # из /etc/ppp/ip-up.d: ppp-up <ipparam> <iface>
+        u=$(uplink_by_conn "$2") || exit 0
+        load_uplink "$u" || exit 0
+        echo "$3" > "$U_IFACE_FILE"
+        ip route replace default dev "$3" metric 50 table "$U_TABLE"
+        ip route flush cache
+        ;;
+    ppp-down)
+        u=$(uplink_by_conn "$2") || exit 0
+        load_uplink "$u" || exit 0
+        rm -f "$U_IFACE_FILE"
+        ip route del default dev "$3" metric 50 table "$U_TABLE" 2>/dev/null
+        ;;
+    exits) for u in $(exit_names); do load_uplink "$u"; echo "$u  $U_TITLE  $U_IP  порт $U_PORT"; done ;;
+    exit-add) shift; exit_add "$@" ;;
+    exit-del) exit_del "${2:-}" ;;
+    xray-sync) xray_sync ;;
+    links) links ;;
     down)
         systemctl stop l2tp-exit 2>/dev/null
-        ctl "d $CONN"
-        swanctl --terminate --ike $CONN >/dev/null 2>&1
+        for u in $(uplinks); do load_uplink "$u" && { ctl "d $U_CONN"; swanctl --terminate --ike "$U_CONN" >/dev/null 2>&1; }; done
         remove_routes
         remove_fw
-        log "туннель остановлен, маршрутизация возвращена к исходной"
+        log "туннели остановлены, маршрутизация возвращена к исходной"
         ;;
-    *) echo "usage: $0 {status|down|reconnect|apply|apply-config|apply-dns|routes|watch}"; exit 1 ;;
+    *) echo "usage: $0 {status|down|reconnect|apply|exits|exit-add|exit-del|xray-sync|links|routes|watch}"; exit 1 ;;
 esac
 HELPER_EOF
 chmod 755 $HELPER
@@ -678,6 +1057,9 @@ L2TP_NET='$L2TP_NET'
 L2TP_PSK='$L2TP_PSK'
 L2TP_USER='$L2TP_USER'
 L2TP_PASSWORD='$L2TP_PASSWORD'
+MAIN_INBOUND_REMARK='$INBOUND_REMARK'
+MAIN_TITLE='$MAIN_TITLE'
+ENTRY_HOST='$ENTRY_HOST'
 EOF
 umask 022
 rm -f $CONF_DIR/l2tp-server.env
@@ -1015,6 +1397,14 @@ fi
 # Итог
 # ---------------------------------------------------------------------------
 
+# Доп. выходы (exits.d): их inbound'ы и маршруты Xray — после основного inbound
+EXIT_LINKS=""
+if [[ -n $(ls $CONF_DIR/exits.d/*.env 2>/dev/null) ]]; then
+    log "Синхронизирую дополнительные выходы ..."
+    $HELPER xray-sync || warn "Не удалось настроить дополнительные выходы в 3x-ui (см. выше)"
+    EXIT_LINKS=$($HELPER links 2>/dev/null) || EXIT_LINKS=""
+fi
+
 SUB_URL=""
 if [[ -n $SUB_DOMAIN ]]; then
     log "Включаю подписку по HTTPS на $SUB_DOMAIN ..."
@@ -1075,6 +1465,7 @@ import urllib.parse
 ENV_FILE = '/etc/l2tp-exit/l2tp-exit.env'
 HELPER = '/usr/local/sbin/l2tp-exit'
 IFACE_FILE = '/run/l2tp-exit.iface'
+EXITS_DIR = '/etc/l2tp-exit/exits.d'
 PAM_SERVICE = 'l2tp-exit-web'
 ALLOWED_USER = 'root'
 SESSION_TTL = 12 * 3600
@@ -1191,25 +1582,34 @@ def run(cmd, timeout=90):
 
 
 def status():
-    st = {'tunnel': False, 'iface': '', 'ipsec': False, 'l2tp_clients': 0, 'exit_ip': ''}
+    rc, out = run([HELPER, 'status-json'], 60)
     try:
-        with open(IFACE_FILE) as f:
-            iface = f.read().strip()
-        rc, out = run(['ip', '-4', 'addr', 'show', 'dev', iface], 5)
-        st['iface'] = iface
-        st['tunnel'] = rc == 0 and 'inet ' in out
-    except OSError:
-        pass
-    _, out = run(['swanctl', '--list-sas', '--ike', 'l2tp-exit'], 10)
-    st['ipsec'] = 'INSTALLED' in out
+        tunnels = json.loads(out) if rc == 0 else []
+    except ValueError:
+        tunnels = []
     _, out = run(['swanctl', '--list-sas', '--ike', 'l2tp-server'], 10)
-    st['l2tp_clients'] = len(re.findall(r'^l2tp-server: #', out, re.M))
-    _, out = run(['systemctl', 'is-active', 'l2tp-exit'], 5)
-    st['service'] = out
-    if st['tunnel']:
-        _, out = run(['curl', '-4', '-s', '--max-time', '6', 'https://ipv4.icanhazip.com'], 10)
-        st['exit_ip'] = out if re.match(r'^[0-9.]+$', out) else ''
-    return st
+    return {'tunnels': tunnels, 'l2tp_clients': len(re.findall(r'^l2tp-server: #', out, re.M))}
+
+
+def read_exits():
+    exits = []
+    try:
+        names = sorted(f[:-4] for f in os.listdir(EXITS_DIR) if f.endswith('.env'))
+    except OSError:
+        return exits
+    for name in names:
+        d = {}
+        try:
+            with open(os.path.join(EXITS_DIR, name + '.env')) as f:
+                for line in f:
+                    m = re.match(r"^([A-Z_]+)='(.*)'$", line.strip())
+                    if m:
+                        d[m.group(1)] = m.group(2)
+        except OSError:
+            continue
+        exits.append({'name': name, 'title': d.get('TITLE', name), 'ip': d.get('SERVER_IP', ''),
+                      'port': d.get('PORT', '')})
+    return exits
 
 # --------------------------------------------------------------------- sessions
 
@@ -1260,6 +1660,9 @@ MESSAGES = {
     'same_psk': ('err', 'PSK сервера №2 должен отличаться от PSK L2TP-клиентов этого сервера.'),
     'apply_failed': ('err', 'Не удалось применить настройки, подробности в journalctl -u l2tp-exit-web.'),
     'csrf': ('err', 'Сессия устарела, обновите страницу.'),
+    'exit_added': ('ok', 'Выход сохранён. Туннели переподключаются, это займёт до минуты. Ссылки — в «Ссылках для подключения» или в подписке.'),
+    'exit_deleted': ('ok', 'Выход удалён.'),
+    'bad_exit': ('err', 'Имя выхода — латиница и цифры, до 12 символов, начинается с буквы (например de, in). В названии не должно быть кавычек.'),
 }
 
 CSS = '''
@@ -1288,6 +1691,12 @@ button.ghost{background:transparent;color:var(--accent);border:1px solid var(--l
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:var(--muted)}
 .up{background:var(--ok)}.down{background:var(--err)}
 .top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:middle}
+th{color:var(--muted);font-weight:500;font-size:13px}td form{margin:0}td button{margin:0;padding:4px 9px;font-size:13px}
+td.t,td.ip{white-space:nowrap}td:last-child{width:1%}
+.tbl{overflow-x:auto}.row2{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+@media (max-width:560px){.row2{grid-template-columns:1fr}}
+textarea{width:100%;min-height:90px;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:13px/1.4 ui-monospace,Menlo,monospace}
 '''
 
 
@@ -1309,29 +1718,58 @@ def login_page(error=''):
 
 def main_page(sess, msg_code):
     env = read_env()
+    exits = read_exits()
     e = lambda k, d='': html.escape(env.get(k, d), quote=True)
     csrf = f'<input type="hidden" name="csrf" value="{sess["csrf"]}">'
     msg = ''
     if msg_code in MESSAGES:
         kind, text = MESSAGES[msg_code]
         msg = f'<div class="msg {kind}">{html.escape(text)}</div>'
+    flash = sess.pop('flash', None)
+    if flash:
+        msg += f'<div class="msg {flash[0]}">{html.escape(flash[1])}</div>'
+    rows = ''.join(f'''<tr data-n="{html.escape(x["name"])}"><td><b>{html.escape(x["title"])}</b>
+<div class="hint">{html.escape(x["name"])} · {html.escape(x["ip"])} · порт {html.escape(x["port"])}</div></td>
+<td class="t">…</td><td class="ip">…</td><td><form method="post" action="/exit-del"
+onsubmit="return confirm('Удалить выход {html.escape(x["title"])}? Подключение на порту {html.escape(x["port"])} перестанет работать.')">{csrf}
+<input type="hidden" name="name" value="{html.escape(x["name"])}"><button class="ghost" type="submit" title="Удалить выход" aria-label="Удалить выход">✕</button></form></td></tr>'''
+                   for x in exits)
     ks = env.get('KILL_SWITCH', '1') == '1'
     set_dns = env.get('SET_DNS', '1') == '1'
     return page('Туннель — сервер №1', f'''
 <div class="top"><div><h1>Управление туннелем</h1>
-<p class="sub">Сервер №1 → сервер №2 ({e("VPN_SERVER_IP")})</p></div>
+<p class="sub">Сервер №1 · выходов: {1 + len(exits)}</p></div>
 <form method="post" action="/logout">{csrf}<button class="ghost" type="submit">Выйти</button></form></div>
 {msg}
-<section class="card"><h2>Состояние</h2><div class="grid" id="st">
-<div><div class="k">Туннель</div><div class="v" id="st-tunnel">…</div></div>
-<div><div class="k">IPsec</div><div class="v" id="st-ipsec">…</div></div>
-<div><div class="k">Внешний IP</div><div class="v" id="st-ip">…</div></div>
-<div><div class="k">L2TP-клиентов</div><div class="v" id="st-l2tp">…</div></div>
-</div>
-<form method="post" action="/reconnect">{csrf}<button class="ghost" type="submit">Переподключить туннель</button></form>
+<section class="card"><h2>Выходы</h2><div class="tbl"><table>
+<thead><tr><th>Выход</th><th>Туннель</th><th>Внешний IP</th><th></th></tr></thead><tbody>
+<tr data-n="main"><td><b>{e("MAIN_TITLE", "Основной")}</b><div class="hint">основной · {e("VPN_SERVER_IP")}</div></td>
+<td class="t">…</td><td class="ip">…</td><td></td></tr>
+{rows}</tbody></table></div>
+<p class="hint">Через основной выход идут трафик самого сервера, L2TP-клиенты и основное подключение VLESS.
+Каждый дополнительный выход — отдельное подключение VLESS на своём порту. L2TP-клиентов сейчас: <b id="st-l2tp">…</b></p>
+<div style="display:flex;gap:10px;flex-wrap:wrap">
+<form method="post" action="/reconnect">{csrf}<button class="ghost" type="submit">Переподключить туннели</button></form>
+<form method="get" action="/links"><button class="ghost" type="submit">Ссылки для подключения</button></form></div>
 </section>
 
-<form class="card" method="post" action="/uplink">{csrf}<h2>Сервер №2</h2>
+<form class="card" method="post" action="/exit-add">{csrf}<h2>Добавить выход</h2>
+<p class="hint">На новом выходном сервере сначала запустите <code>exit-server.sh</code> — он напечатает IP, PSK, логин и пароль.</p>
+<div class="row2">
+<div><label for="xn">Имя (латиница)</label><input type="text" id="xn" name="name" placeholder="in" required pattern="[a-z][a-z0-9]{{0,11}}"></div>
+<div><label for="xt">Название</label><input type="text" id="xt" name="title" placeholder="Индия" required></div>
+<div><label for="xi">IP сервера</label><input type="text" id="xi" name="ip" required></div>
+<div><label for="xp">Порт VLESS (необязательно)</label><input type="text" id="xp" name="port" placeholder="авто: 2053, 2083, …"></div>
+<div><label for="xk">IPsec PSK</label><input type="password" id="xk" name="psk" required autocomplete="off"></div>
+<div><label for="xu">Логин L2TP</label><input type="text" id="xu" name="user" required></div>
+<div><label for="xw">Пароль L2TP</label><input type="password" id="xw" name="password" required autocomplete="off"></div>
+</div>
+<p class="hint">Для каждого выхода в 3x-ui создаётся копия основного подключения на своём порту. Клиенты получают его
+в той же подписке. Если порт закрыт файрволом провайдера, откройте его. При добавлении туннели и L2TP-клиенты
+переподключаются (до минуты). Существующее имя — это изменение выхода, порт при этом сохраняется.</p>
+<button type="submit">Добавить</button></form>
+
+<form class="card" method="post" action="/uplink">{csrf}<h2>Основной выход (сервер №2)</h2>
 <label for="ip">IP-адрес</label><input type="text" id="ip" name="ip" value="{e("VPN_SERVER_IP")}" required>
 <label for="psk">IPsec PSK</label><input type="password" id="psk" name="psk" placeholder="не менять" autocomplete="off">
 <label for="user">Логин L2TP</label><input type="text" id="user" name="user" value="{e("VPN_USER")}" required>
@@ -1365,14 +1803,51 @@ async function refresh(){{
   try{{
     const r=await fetch('/api/status',{{credentials:'same-origin'}}); if(!r.ok) return;
     const s=await r.json(); const dot=u=>'<span class="dot '+(u?'up':'down')+'"></span>';
-    document.getElementById('st-tunnel').innerHTML=dot(s.tunnel)+(s.tunnel?'работает':'не работает');
-    document.getElementById('st-ipsec').innerHTML=dot(s.ipsec)+(s.ipsec?'установлен':'нет');
-    document.getElementById('st-ip').textContent=s.exit_ip||'—';
+    for(const t of s.tunnels){{
+      const row=document.querySelector('tr[data-n="'+CSS.escape(t.name)+'"]'); if(!row) continue;
+      row.querySelector('.t').innerHTML=dot(t.tunnel)+(t.tunnel?'работает':(t.ipsec?'IPsec есть, PPP нет':'не работает'));
+      row.querySelector('.ip').textContent=t.exit_ip||'—';
+    }}
     document.getElementById('st-l2tp').textContent=s.l2tp_clients;
   }}catch(e){{}}
 }}
-refresh(); setInterval(refresh,10000);
+refresh(); setInterval(refresh,15000);
 </script>''')
+
+def helper_error(out):
+    # Последние сообщения хелпера («l2tp-exit: ...») — понятная причина ошибки
+    lines = [l.split('l2tp-exit: ', 1)[-1] for l in out.splitlines() if 'l2tp-exit: ' in l]
+    return 'Не получилось: ' + (lines[-1] if lines else 'подробности в journalctl -u l2tp-exit-web')
+
+
+def links_page():
+    rc, out = run([HELPER, 'links'], 30)
+    items = [l for l in out.splitlines() if l.startswith('vless://')] if rc == 0 else []
+    try:
+        with open('/root/vpn-access.txt') as f:
+            acc = f.read()
+        main_link = re.search(r'vless://\S+', acc)
+        sub = re.search(r'https://\S+/sub/\S+', acc)
+    except OSError:
+        main_link = sub = None
+    blocks = ''
+    if sub:
+        blocks += f'''<section class="card"><h2>Подписка (все выходы сразу)</h2>
+<textarea readonly onclick="this.select()">{html.escape(sub.group(0))}</textarea>
+<p class="hint">Добавьте её в Happ один раз: новые выходы появятся сами после обновления подписки.</p></section>'''
+    if main_link:
+        blocks += f'''<section class="card"><h2>Основной выход</h2>
+<textarea readonly onclick="this.select()">{html.escape(main_link.group(0))}</textarea></section>'''
+    for l in items:
+        title = urllib.parse.unquote(l.rsplit('#', 1)[-1])
+        blocks += f'''<section class="card"><h2>{html.escape(title)}</h2>
+<textarea readonly onclick="this.select()">{html.escape(l)}</textarea></section>'''
+    if not blocks:
+        blocks = '<p class="card">Ссылок пока нет.</p>'
+    return page('Ссылки — туннель', f'''<div class="top"><div><h1>Ссылки для подключения</h1>
+<p class="sub">Скопируйте ссылку в Happ или другой клиент VLESS.</p></div>
+<form method="get" action="/"><button class="ghost" type="submit">Назад</button></form></div>{blocks}''')
+
 
 # --------------------------------------------------------------------- handler
 
@@ -1437,6 +1912,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._redirect('/login')
         if url.path == '/api/status':
             return self._send(200, json.dumps(status()), 'application/json')
+        if url.path == '/links':
+            return self._send(200, links_page())
         if url.path == '/':
             q = urllib.parse.parse_qs(url.query)
             return self._send(200, main_page(sess, q.get('m', [''])[0]))
@@ -1484,6 +1961,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._redirect('/?m=mode')
         if path == '/dns':
             return self._redirect('/?m=' + self.save_dns(form))
+        if path == '/exit-add':
+            return self._redirect('/?m=' + self.exit_add(form, sess))
+        if path == '/exit-del':
+            name = form.get('name', '')
+            if not re.match(r'^[a-z][a-z0-9]{0,11}$', name):
+                return self._redirect('/?m=bad_exit')
+            rc, out = run([HELPER, 'exit-del', name], 180)
+            if rc != 0:
+                sess['flash'] = ('err', helper_error(out))
+                return self._redirect('/')
+            return self._redirect('/?m=exit_deleted')
         self._send(404, page('404', '<p>Не найдено.</p>'))
 
     def save_uplink(self, form):
@@ -1508,6 +1996,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sys.stderr.write('apply failed: %s\n' % out)
             return 'apply_failed'
         return 'uplink'
+
+    def exit_add(self, form, sess):
+        name = form.get('name', '').strip()
+        title = form.get('title', '').strip()
+        port = form.get('port', '').strip()
+        if not re.match(r'^[a-z][a-z0-9]{0,11}$', name) or name == 'main' or not title \
+                or re.search(r"['\"\\\n]", title) or len(title) > 40:
+            return 'bad_exit'
+        try:
+            ip = str(ipaddress.IPv4Address(form.get('ip', '').strip()))
+        except ValueError:
+            return 'bad_ip'
+        vals = [form.get(k, '') for k in ('psk', 'user', 'password')]
+        if not all(SAFE_VALUE.match(v) for v in vals):
+            return 'bad_value'
+        if port and not re.match(r'^[0-9]{2,5}$', port):
+            return 'bad_exit'
+        cmd = [HELPER, 'exit-add', name, title, ip] + vals + ([port] if port else [])
+        rc, out = run(cmd, 240)
+        if rc != 0:
+            sess['flash'] = ('err', helper_error(out))
+            return ''
+        return 'exit_added'
 
     def save_dns(self, form):
         items = [x for x in re.split(r'[\s,;]+', form.get('dns', '')) if x]
@@ -1641,6 +2152,11 @@ summary() {
     echo
     echo "  $VLESS_LINK"
     echo
+    if [[ -n $EXIT_LINKS ]]; then
+        echo "  Дополнительные выходы:"
+        while read -r l; do echo "  $l"; done <<<"$EXIT_LINKS"
+        echo
+    fi
     if [[ -n $SUB_URL ]]; then
         echo "  Подписка (HTTPS, для Happ и др.):"
         echo "  $SUB_URL"

@@ -95,3 +95,8 @@ echo -e "${green}Команда для сервера №1 (входного):${
 echo
 echo "  VPN_SERVER_IP='$PUBLIC_IP' VPN_IPSEC_PSK='$VPN_IPSEC_PSK' VPN_USER='$VPN_USER' VPN_PASSWORD='$VPN_PASSWORD' bash <(curl -fsSL $REPO_RAW/entry-server.sh)"
 echo
+echo -e "${green}Или, если сервер №1 уже настроен, — как дополнительный выход${plain}"
+echo "  (веб-интерфейс сервера №1 → «Добавить выход», или на сервере №1):"
+echo
+echo "  l2tp-exit exit-add <имя, напр. in> '<Название>' $PUBLIC_IP '$VPN_IPSEC_PSK' '$VPN_USER' '$VPN_PASSWORD'"
+echo
