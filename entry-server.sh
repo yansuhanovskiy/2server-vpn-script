@@ -274,10 +274,17 @@ apply_routes() {
         return 0
     fi
     log "применяю маршруты ($sig)"
+    # onlink: у многих VDS шлюз вне подсети адреса (/32 и т.п.)
     if [ -n "$gw" ]; then
-        ip route replace default via "$gw" dev "$dev" table $T_DIRECT
+        ip route replace default via "$gw" dev "$dev" onlink table $T_DIRECT
     else
         ip route replace default dev "$dev" table $T_DIRECT
+    fi
+    # Без прямого маршрута правила ниже отправили бы ответы SSH в туннель/kill switch
+    if ! ip -4 route show table $T_DIRECT | grep -q '^default'; then
+        log "не удалось создать прямой маршрут в таблице $T_DIRECT, правила не применяю"
+        flush_rules
+        return 1
     fi
     flush_rules
     ip -4 rule add pref 1000 to "$VPN_SERVER_IP" lookup $T_DIRECT
@@ -430,8 +437,17 @@ systemctl enable "$SWAN_UNIT" xl2tpd >/dev/null 2>&1
 systemctl restart "$SWAN_UNIT"
 systemctl restart xl2tpd
 sleep 2
-swanctl --load-all --noprompt >/dev/null
+swanctl --load-all --noprompt >/dev/null 2>&1 || true
 rm -f /run/l2tp-exit.routes
+
+# Страховка: если связь с сервером потеряется и скрипт не дойдёт до конца
+# (например, умрёт вместе с SSH-сессией), через 5 минут всё откатится.
+systemctl stop $CONN-rollback.timer $CONN-rollback.service >/dev/null 2>&1 || true
+systemctl reset-failed $CONN-rollback.service >/dev/null 2>&1 || true
+systemd-run --quiet --unit=$CONN-rollback --on-active=300 \
+    /bin/sh -c "systemctl disable $CONN; $HELPER down" \
+    || warn "Не удалось поставить таймер отката"
+
 systemctl enable $CONN >/dev/null 2>&1
 systemctl restart $CONN
 
@@ -450,8 +466,21 @@ if [[ $up != 1 ]]; then
     journalctl -u xl2tpd -n 20 --no-pager || true
     systemctl disable $CONN >/dev/null 2>&1 || true
     $HELPER down || true
+    systemctl stop $CONN-rollback.timer >/dev/null 2>&1 || true
     die "Туннель не поднялся за 90 секунд. Маршрутизация откатена. Проверьте данные доступа и что на сервере №2 открыты UDP 500/4500."
 fi
+
+# Прямой путь (им ходят ответы на SSH и клиентам) должен работать
+DIRECT_IP=$(curl -4 -fsS --max-time 10 --interface "$WAN_IP" https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]') || DIRECT_IP=""
+if [[ -z $DIRECT_IP ]]; then
+    systemctl disable $CONN >/dev/null 2>&1 || true
+    $HELPER down || true
+    systemctl stop $CONN-rollback.timer >/dev/null 2>&1 || true
+    ip -4 route show table main
+    die "Прямой маршрут через $WAN_DEV не работает при включённом туннеле. Всё откатил, пришлите вывод выше."
+fi
+systemctl stop $CONN-rollback.timer >/dev/null 2>&1 || true
+log "Прямой маршрут работает, таймер отката снят"
 
 EXIT_IP=$(curl -4 -fsS --max-time 10 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]') || EXIT_IP=""
 if [[ -z $EXIT_IP ]]; then
