@@ -34,7 +34,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
-SCRIPT_VERSION=3
+SCRIPT_VERSION=4
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -609,7 +609,7 @@ else
       expiryTime: 0, total: 0, up: 0, down: 0,
       settings: {
         clients: [{ id: $id, flow: "xtls-rprx-vision", email: $email, limitIp: 0,
-                    totalGB: 0, expiryTime: 0, enable: true, tgId: "", subId: $sub,
+                    totalGB: 0, expiryTime: 0, enable: true, subId: $sub,
                     comment: "", reset: 0 }],
         decryption: "none", fallbacks: []
       },
