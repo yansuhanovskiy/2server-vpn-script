@@ -34,6 +34,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
+SCRIPT_VERSION=3
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -50,6 +51,7 @@ rand() {
 # Проверки и параметры
 # ---------------------------------------------------------------------------
 
+log "entry-server.sh, версия $SCRIPT_VERSION"
 [[ $EUID -eq 0 ]] || die "Запустите от root."
 [[ -f /etc/debian_version ]] || die "Поддерживаются только Debian/Ubuntu."
 
@@ -234,19 +236,20 @@ chmod 755 /etc/ppp/ip-up.d/$CONN /etc/ppp/ip-down.d/$CONN
 # Хелпер: маршрутизация + watchdog
 # ---------------------------------------------------------------------------
 #
-# Таблица 201 (direct): default через исходный шлюз провайдера.
 # Таблица 202 (tunnel): default через ppp, при KILL_SWITCH=1 ещё unreachable.
-#   pref 1000  to VPN_SERVER_IP      -> 201   (IKE/ESP/L2TP идут напрямую)
-#   pref 1001  from <IP на WAN_DEV>  -> 201   (ответы клиентам, SSH, панель)
-#   pref 1002  main без default      -> подсети провайдера, peer ppp и т.д.
-#   pref 1003  всё остальное         -> 202   (в туннель)
-# Таблица main не меняется, поэтому `l2tp-exit down` полностью откатывает схему.
+# Прямой трафик смотрит в НЕИЗМЕНЁННУЮ таблицу main (исходная маршрутизация
+# сервера), поэтому SSH идёт ровно тем путём, что и до установки.
+#   pref 999   TCP с исходящим портом sshd -> main (SSH, даже на нестандартном порту)
+#   pref 1000  to VPN_SERVER_IP            -> main (IKE/ESP/L2TP идут напрямую)
+#   pref 1001  from <IP на WAN_DEV>        -> main (ответы клиентам, SSH, панель)
+#   pref 1002  main без default            -> подсети провайдера, peer ppp и т.д.
+#   pref 1003  всё остальное               -> 202  (в туннель)
+# `l2tp-exit down` удаляет правила и полностью откатывает схему.
 
 cat > $HELPER <<'HELPER_EOF'
 #!/bin/bash
 set -u
 CONN=l2tp-exit
-T_DIRECT=201
 T_TUN=202
 CTL=/var/run/xl2tpd/l2tp-control
 IFACE_FILE=/run/l2tp-exit.iface
@@ -257,39 +260,34 @@ log() { echo "l2tp-exit: $*"; }
 
 flush_rules() {
     local p
-    for p in 1000 1001 1002 1003; do
+    for p in 999 1000 1001 1002 1003; do
         while ip -4 rule del pref $p 2>/dev/null; do :; done
     done
 }
 
+ssh_ports() {
+    { sshd -T 2>/dev/null | awk '$1=="port"{print $2}'; echo 22; } | sort -u
+}
+
 apply_routes() {
-    local line dev gw ips sig ip
+    local line dev ips sig ip port
     line=$(ip -4 route show default table main | head -n1)
-    [ -n "$line" ] || { log "нет default-маршрута в main"; return 1; }
+    # Без default в main правила отправили бы ответы SSH в kill switch
+    [ -n "$line" ] || { log "нет default-маршрута в main, правила не применяю"; flush_rules; return 1; }
     dev=$(awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$line")
-    gw=$(awk '{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$line")
     ips=$(ip -4 -o addr show dev "$dev" scope global | awk '{split($4,a,"/"); print a[1]}' | tr '\n' ' ')
-    sig="$dev|$gw|$ips|$VPN_SERVER_IP|$KILL_SWITCH"
+    sig="$dev|$ips|$(ssh_ports | tr '\n' ' ')|$VPN_SERVER_IP|$KILL_SWITCH"
     if [ "$sig" = "$(cat $SIG_FILE 2>/dev/null)" ] && ip -4 rule show pref 1003 | grep -q .; then
         return 0
     fi
     log "применяю маршруты ($sig)"
-    # onlink: у многих VDS шлюз вне подсети адреса (/32 и т.п.)
-    if [ -n "$gw" ]; then
-        ip route replace default via "$gw" dev "$dev" onlink table $T_DIRECT
-    else
-        ip route replace default dev "$dev" table $T_DIRECT
-    fi
-    # Без прямого маршрута правила ниже отправили бы ответы SSH в туннель/kill switch
-    if ! ip -4 route show table $T_DIRECT | grep -q '^default'; then
-        log "не удалось создать прямой маршрут в таблице $T_DIRECT, правила не применяю"
-        flush_rules
-        return 1
-    fi
     flush_rules
-    ip -4 rule add pref 1000 to "$VPN_SERVER_IP" lookup $T_DIRECT
+    for port in $(ssh_ports); do
+        ip -4 rule add pref 999 ipproto tcp sport "$port" lookup main 2>/dev/null
+    done
+    ip -4 rule add pref 1000 to "$VPN_SERVER_IP" lookup main
     for ip in $ips; do
-        ip -4 rule add pref 1001 from "$ip" lookup $T_DIRECT
+        ip -4 rule add pref 1001 from "$ip" lookup main
     done
     ip -4 rule add pref 1002 lookup main suppress_prefixlength 0
     ip -4 rule add pref 1003 lookup $T_TUN
@@ -308,7 +306,7 @@ apply_routes() {
 
 remove_routes() {
     flush_rules
-    ip route flush table $T_DIRECT 2>/dev/null
+    ip route flush table 201 2>/dev/null   # от старых версий скрипта
     ip route flush table $T_TUN 2>/dev/null
     rm -f $SIG_FILE
     ip route flush cache
@@ -372,8 +370,7 @@ watch() {
 status() {
     echo "--- IPsec"; swanctl --list-sas --ike $CONN 2>/dev/null
     echo "--- PPP";   if is_up; then ip -4 addr show dev "$(cat $IFACE_FILE)"; else echo "down"; fi
-    echo "--- rules"; ip -4 rule show | grep -E '^100[0-3]:'
-    echo "--- table $T_DIRECT"; ip route show table $T_DIRECT
+    echo "--- rules"; ip -4 rule show | grep -E '^(999|100[0-3]):'
     echo "--- table $T_TUN";    ip route show table $T_TUN
     echo "--- exit IP"; curl -4 -s --max-time 8 https://ipv4.icanhazip.com || echo "недоступно"
 }
