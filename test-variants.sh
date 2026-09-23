@@ -95,7 +95,10 @@ add() {
     if [[ $ok != 1 ]]; then
         echo "[$remark] Xray не принял конфиг, удаляю:" >&2
         journalctl -u x-ui -n 30 --no-pager | grep -m1 'Failed to start' >&2 || true
-        api POST "/panel/api/inbounds/del/$(jq -r '.obj.id' <<<"$resp")" >/dev/null
+        local bad
+        for bad in $(api GET /panel/api/inbounds/list | jq -r --arg r "$remark" '.obj[]? | select(.remark==$r) | .id'); do
+            api POST "/panel/api/inbounds/del/$bad" >/dev/null
+        done
         systemctl restart x-ui
         sleep 5
         return
