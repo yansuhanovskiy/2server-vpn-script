@@ -34,7 +34,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
-SCRIPT_VERSION=5
+SCRIPT_VERSION=6
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -627,49 +627,6 @@ else
     }')
     resp=$(api POST /panel/api/inbounds/add "$payload")
     jq -e '.success' >/dev/null <<<"$resp" || die "Не удалось создать inbound: $resp"
-fi
-
-# Источник истины — config.json, с которым реально работает Xray: панель может
-# сохранить не те ключи, что ей передали, и тогда ссылка не пройдёт Reality.
-XRAY_BIN=$(ls $XUI_DIR/bin/xray-linux-* 2>/dev/null | head -n1)
-XRAY_CFG=$XUI_DIR/bin/config.json
-ib=""
-for _ in $(seq 1 30); do
-    ib=$(jq -c --argjson p "$INBOUND_PORT" '[.inbounds[]? | select(.port==$p)][0] // empty' "$XRAY_CFG" 2>/dev/null) || ib=""
-    [[ -n $ib ]] && break
-    sleep 1
-done
-[[ -n $ib ]] || die "Xray не подхватил inbound на порту $INBOUND_PORT (нет в $XRAY_CFG)"
-
-real_priv=$(jq -r '.streamSettings.realitySettings.privateKey // empty' <<<"$ib")
-[[ -n $real_priv ]] || die "В конфиге Xray нет privateKey для Reality"
-real_pbk=$("$XRAY_BIN" x25519 -i "$real_priv" | grep -iE 'public|password' | head -n1 | awk -F': ' '{print $2}' | tr -d '[:space:]')
-[[ -n $real_pbk ]] || die "Не удалось вычислить публичный ключ Reality"
-real_sid=$(jq -r '.streamSettings.realitySettings.shortIds[0] // empty' <<<"$ib")
-real_sni=$(jq -r '.streamSettings.realitySettings.serverNames[0] // empty' <<<"$ib")
-real_ids=$(jq -r '.settings.clients[]?.id // empty' <<<"$ib")
-
-[[ -n $real_sid ]] && SID=$real_sid
-[[ -n $real_sni ]] && REALITY_SNI=$real_sni
-if [[ -n $real_ids ]] && ! grep -qx "$CLIENT_ID" <<<"$real_ids"; then
-    warn "UUID $CLIENT_ID не найден в конфиге Xray, беру первый клиент оттуда"
-    CLIENT_ID=$(head -n1 <<<"$real_ids")
-fi
-[[ -n $real_ids ]] || warn "В конфиге Xray у inbound нет клиентов — подключение работать не будет"
-
-if [[ $real_pbk != "$PBK" ]]; then
-    warn "Публичный ключ в панели ($PBK) не соответствует приватному, исправляю"
-    PBK=$real_pbk
-    cur=$(api GET /panel/api/inbounds/list | jq -c --argjson p "$INBOUND_PORT" '[.obj[]? | select(.port==$p)][0] // empty')
-    if [[ -n $cur ]]; then
-        upd=$(jq -c --arg pbk "$PBK" "$JQ_DEFS"'
-            del(.clientStats) | .settings |= j | .sniffing |= j
-            | .streamSettings |= (j | .realitySettings.settings.publicKey = $pbk)' <<<"$cur")
-        id=$(jq -r '.id' <<<"$cur")
-        resp=$(api POST "/panel/api/inbounds/update/$id" "$upd")
-        jq -e '.success' >/dev/null 2>&1 <<<"$resp" \
-            || warn "Не удалось исправить ключ в панели ($resp). Ссылка ниже верная, но QR в панели — нет."
-    fi
 fi
 
 VLESS_LINK="vless://${CLIENT_ID}@${PUBLIC_IP}:${INBOUND_PORT}?type=tcp&security=reality&pbk=${PBK}&fp=chrome&sni=${REALITY_SNI}&sid=${SID}&spx=%2F&flow=xtls-rprx-vision#${INBOUND_REMARK}"
