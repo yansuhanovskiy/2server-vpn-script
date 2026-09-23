@@ -32,6 +32,10 @@
 #   XUI_VERSION=v3.8.5               версия 3x-ui (проверенная; latest — на свой риск)
 #   L2TP_SERVER=1                    L2TP/IPsec сервер на этом узле (0 — не ставить)
 #   L2TP_PSK / L2TP_USER / L2TP_PASSWORD  данные для L2TP-клиентов (иначе случайные)
+#   SUB_DOMAIN=vpn.example.com       домен (A-запись на этот сервер): сертификат Let's
+#                                    Encrypt, HTTPS для подписки и панели. Нужен свободный
+#                                    порт 80. Без него подписка только по HTTP, а Happ
+#                                    такие не принимает.
 #
 # Повторный запуск безопасен: конфиги перезаписываются, существующий inbound
 # и учётные данные панели переиспользуются.
@@ -43,7 +47,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
-SCRIPT_VERSION=10
+SCRIPT_VERSION=11
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -132,6 +136,9 @@ SET_DNS=${SET_DNS:-1}
 XUI_VERSION=${XUI_VERSION:-v3.8.5}
 L2TP_SERVER=${L2TP_SERVER:-1}
 L2TP_NET=192.168.50
+SUB_DOMAIN=${SUB_DOMAIN:-}
+SUB_DOMAIN=${SUB_DOMAIN,,}
+[[ -z $SUB_DOMAIN || $SUB_DOMAIN =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$ ]] || die "SUB_DOMAIN: некорректный домен"
 
 mkdir -p "$CONF_DIR"
 chmod 700 "$CONF_DIR"
@@ -738,6 +745,40 @@ else
     log "3x-ui уже установлен, пропускаю установку."
 fi
 
+SUB_CERT=""; SUB_KEY=""
+if [[ -n $SUB_DOMAIN ]]; then
+    log "Получаю сертификат Let's Encrypt для $SUB_DOMAIN ..."
+    dom_ips=$(getent ahostsv4 "$SUB_DOMAIN" | awk '{print $1}' | sort -u | tr '\n' ' ')
+    grep -qw "$PUBLIC_IP" <<<"$dom_ips" \
+        || die "$SUB_DOMAIN указывает на [${dom_ips:-ничего}], а не на $PUBLIC_IP. Настройте A-запись (без проксирования Cloudflare) и перезапустите."
+    if ss -Hltn "sport = :80" | grep -q .; then
+        die "Порт 80 занят — он нужен Let's Encrypt для проверки домена. Освободите его и перезапустите."
+    fi
+    apt-get install -y -qq socat cron >/dev/null
+    ACME=/root/.acme.sh/acme.sh
+    if [[ ! -x $ACME ]]; then
+        curl -fsSL --retry 3 https://get.acme.sh | sh >/dev/null || die "Не удалось установить acme.sh"
+    fi
+    $ACME --set-default-ca --server letsencrypt >/dev/null
+    rc=0
+    $ACME --issue -d "$SUB_DOMAIN" --standalone --httpport 80 --keylength ec-256 >/tmp/acme.log 2>&1 || rc=$?
+    # 2 = сертификат уже есть и ещё не пора обновлять
+    if [[ $rc != 0 && $rc != 2 ]]; then
+        tail -20 /tmp/acme.log >&2
+        die "Let's Encrypt не выдал сертификат. Проверьте, что порт 80 открыт у провайдера."
+    fi
+    SUB_CERT=/root/cert/$SUB_DOMAIN/fullchain.pem
+    SUB_KEY=/root/cert/$SUB_DOMAIN/privkey.pem
+    mkdir -p "/root/cert/$SUB_DOMAIN"
+    $ACME --install-cert -d "$SUB_DOMAIN" --ecc \
+        --fullchain-file "$SUB_CERT" --key-file "$SUB_KEY" \
+        --reloadcmd "systemctl restart x-ui" >/dev/null 2>&1 \
+        || die "Не удалось установить сертификат (см. /tmp/acme.log)"
+    chmod 600 "$SUB_KEY"
+    $XUI_DIR/x-ui cert -webCert "$SUB_CERT" -webCertKey "$SUB_KEY" >/dev/null \
+        || warn "Не удалось включить HTTPS для панели"
+fi
+
 log "Применяю настройки панели ..."
 $XUI_DIR/x-ui setting -username "$XUI_USERNAME" -password "$XUI_PASSWORD" \
     -port "$XUI_PANEL_PORT" -webBasePath "$XUI_WEB_BASE_PATH" >/dev/null
@@ -816,6 +857,7 @@ fi
 if [[ -n $existing ]]; then
     log "Inbound '$INBOUND_REMARK' уже существует, использую его."
     CLIENT_ID=$(jq -r "$JQ_DEFS"' .settings | j | .clients[0].id' <<<"$existing")
+    SUB_ID=$(jq -r "$JQ_DEFS"' .settings | j | .clients[0].subId // empty' <<<"$existing")
     INBOUND_PORT=$(jq -r '.port' <<<"$existing")
     PBK=$(jq -r "$JQ_DEFS"' .streamSettings | j | .realitySettings.settings.publicKey' <<<"$existing")
     SID=$(jq -r "$JQ_DEFS"' .streamSettings | j | .realitySettings.shortIds[0]' <<<"$existing")
@@ -910,7 +952,30 @@ fi
 # Итог
 # ---------------------------------------------------------------------------
 
-PANEL_URL="$scheme://$PUBLIC_IP:$XUI_PANEL_PORT/$XUI_WEB_BASE_PATH/"
+SUB_URL=""
+if [[ -n $SUB_DOMAIN ]]; then
+    log "Включаю подписку по HTTPS на $SUB_DOMAIN ..."
+    settings=$(api POST /panel/api/setting/all)
+    jq -e '.success' >/dev/null <<<"$settings" || die "Не удалось прочитать настройки панели: $settings"
+    new_settings=$(jq -c --arg d "$SUB_DOMAIN" --arg c "$SUB_CERT" --arg k "$SUB_KEY" \
+        '.obj | .subEnable = true | .subDomain = $d | .subCertFile = $c | .subKeyFile = $k' <<<"$settings")
+    resp=$(api POST /panel/api/setting/update "$new_settings")
+    jq -e '.success' >/dev/null <<<"$resp" || die "Не удалось сохранить настройки подписки: $resp"
+    systemctl restart x-ui
+    sub_port=$(jq -r '.subPort' <<<"$new_settings")
+    sub_path=$(jq -r '.subPath // "/sub/"' <<<"$new_settings")
+    sub_path="/${sub_path#/}"; sub_path="${sub_path%/}/"
+    [[ -n ${SUB_ID:-} ]] && SUB_URL="https://$SUB_DOMAIN:$sub_port$sub_path$SUB_ID"
+    if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
+        ufw allow 80/tcp >/dev/null
+        ufw allow "$sub_port/tcp" >/dev/null
+    fi
+    # Панель теперь тоже по HTTPS — показываем её по домену
+    scheme=https
+    PANEL_HOST=$SUB_DOMAIN
+fi
+
+PANEL_URL="$scheme://${PANEL_HOST:-$PUBLIC_IP}:$XUI_PANEL_PORT/$XUI_WEB_BASE_PATH/"
 
 summary() {
     echo "================ Панель 3x-ui ================"
@@ -930,6 +995,11 @@ summary() {
     echo
     echo "  $VLESS_LINK"
     echo
+    if [[ -n $SUB_URL ]]; then
+        echo "  Подписка (HTTPS, для Happ и др.):"
+        echo "  $SUB_URL"
+        echo
+    fi
     if [[ $L2TP_SERVER == 1 ]]; then
         echo "================ L2TP/IPsec (Windows, macOS, iOS, роутеры) ================"
         echo "  Сервер   : $PUBLIC_IP"
@@ -956,6 +1026,12 @@ echo
 echo -e "${blue}"
 summary
 echo -e "${plain}"
-qrencode -t ansiutf8 "$VLESS_LINK" 2>/dev/null || true
+# QR подписки удобнее: Happ сам подтянет и будет обновлять конфиг
+if [[ -n $SUB_URL ]]; then
+    echo "QR подписки:"
+    qrencode -t ansiutf8 "$SUB_URL" 2>/dev/null || true
+else
+    qrencode -t ansiutf8 "$VLESS_LINK" 2>/dev/null || true
+fi
 echo
 log "Данные сохранены в $ACCESS_FILE"

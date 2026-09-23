@@ -45,6 +45,22 @@ VPN_SERVER_IP='1.2.3.4' VPN_IPSEC_PSK='...' VPN_USER='relay' VPN_PASSWORD='...' 
 скрипт остановится и попросит указать `REALITY_SNI=домен` вручную. Все остальные шаги к этому моменту уже
 выполнены, поэтому повторный запуск проходит быстро.
 
+### Подписка по HTTPS (необязательно)
+Happ и многие другие клиенты не принимают подписку по HTTP. Чтобы включить HTTPS, нужен домен
+с A-записью на сервер №1. Если домен в Cloudflare, проксирование (оранжевое облако) должно быть выключено.
+Передайте домен в переменной `SUB_DOMAIN`:
+
+```bash
+SUB_DOMAIN='vpn.example.com' VPN_SERVER_IP='...' VPN_IPSEC_PSK='...' VPN_USER='...' VPN_PASSWORD='...' \
+  bash <(curl -fsSL https://raw.githubusercontent.com/yansuhanovskiy/2server-vpn-script/main/entry-server.sh)
+```
+
+Скрипт проверит, что домен указывает на сервер, получит сертификат Let's Encrypt через acme.sh
+(на время проверки нужен свободный и открытый **порт 80**) и включит HTTPS для подписки и панели.
+В конце он напечатает ссылку `https://домен:2096/sub/...` и её QR-код. Сертификат обновляется
+автоматически. Если скрипт уже запускался без домена, повторный запуск с `SUB_DOMAIN` ничего
+больше не меняет.
+
 ### L2TP/IPsec для клиентов
 Сервер, PSK, логин и пароль печатаются в конце установки. Их можно задать заранее через `L2TP_PSK`,
 `L2TP_USER` и `L2TP_PASSWORD`, а отключить L2TP можно через `L2TP_SERVER=0`.
@@ -60,7 +76,7 @@ VPN_SERVER_IP='1.2.3.4' VPN_IPSEC_PSK='...' VPN_USER='relay' VPN_PASSWORD='...' 
 
 Необязательные переменные: `INBOUND_PORT`, `REALITY_SNI`, `TRANSPORT` (`xhttp`/`tcp`), `XUI_VERSION`,
 `XUI_USERNAME`, `XUI_PASSWORD`, `XUI_PANEL_PORT`, `XUI_WEB_BASE_PATH`, `XUI_SSL_MODE` (`none`/`ip`/`domain`),
-`L2TP_SERVER`, `L2TP_PSK`, `L2TP_USER`, `L2TP_PASSWORD`, `KILL_SWITCH`, `DISABLE_IPV6`, `SET_DNS`.
+`L2TP_SERVER`, `L2TP_PSK`, `L2TP_USER`, `L2TP_PASSWORD`, `SUB_DOMAIN`, `KILL_SWITCH`, `DISABLE_IPV6`, `SET_DNS`.
 Их описание есть в шапке скрипта.
 
 ### Что по умолчанию меняется на сервере №1
