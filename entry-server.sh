@@ -49,7 +49,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
-SCRIPT_VERSION=14-multi
+SCRIPT_VERSION=15-multi
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -847,7 +847,9 @@ xray_sync() {
         exits=$(echo "$exits" | jq -c --arg n "$u" --arg t "$tag" --argjson m "$U_MARK" '. + [{name: $n, tag: $t, mark: $m}]')
     done
 
-    tmpl=$(xui_api POST /panel/api/xray/ | jq -r '.obj.xraySetting // empty')
+    # obj приходит JSON-строкой внутри JSON (не объектом, как в документации),
+    # xraySetting — тоже строкой; разбираем оба варианта
+    tmpl=$(xui_api POST /panel/api/xray/ | jq -c "$JQ_J"' .obj | j | .xraySetting | j | select(length > 0)' 2>/dev/null)
     [ -n "$tmpl" ] || { log "не удалось прочитать шаблон Xray"; return 1; }
     # Наши каналы добавляются в конец (первый outbound — канал по умолчанию),
     # правила — тоже в конец, после блокировок 3x-ui (private IP, bittorrent)
