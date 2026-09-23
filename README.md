@@ -1,7 +1,9 @@
 # VPN-каскад: 3x-ui → L2TP/IPsec → интернет
 
 ```
-клиенты ──VLESS+Reality──▶ сервер №1 (3x-ui) ──L2TP/IPsec──▶ сервер №2 (hwdsl2) ──▶ интернет
+клиенты ──VLESS+Reality──┐
+                         ├─▶ сервер №1 (3x-ui + L2TP) ──L2TP/IPsec──▶ сервер №2 (hwdsl2) ──▶ интернет
+клиенты ──L2TP/IPsec─────┘
 ```
 
 Поддерживаются Debian 11+ и Ubuntu 22.04+.
@@ -30,16 +32,36 @@ VPN_SERVER_IP='1.2.3.4' VPN_IPSEC_PSK='...' VPN_USER='relay' VPN_PASSWORD='...' 
 1. Настраивает L2TP/IPsec клиент (strongSwan swanctl + xl2tpd) и сервис `l2tp-exit`, который следит за туннелем и переподключает его.
 2. Настраивает policy routing: весь исходящий трафик идёт в туннель, а ответы на входящие
    соединения (SSH, клиенты, панель) уходят напрямую, поэтому SSH не отваливается.
-3. Ставит 3x-ui в неинтерактивном режиме, создаёт inbound VLESS + Reality поверх XHTTP (порт 443) и печатает
-   URL панели, логин и пароль, ссылку `vless://` и QR-код. Всё это сохраняется в `/root/vpn-access.txt`.
+3. Ставит 3x-ui (закреплённая версия `v3.8.5`), создаёт inbound VLESS + Reality поверх XHTTP (порт 443).
+4. Поднимает L2TP/IPsec сервер для устройств без VLESS-клиента: Windows, macOS, iOS, роутеры.
+   Их трафик тоже уходит через сервер №2.
+5. Печатает URL панели, логин и пароль, ссылку `vless://`, QR-код и данные L2TP.
+   Всё это сохраняется в `/root/vpn-access.txt`.
 
-**SNI (`REALITY_SNI`)** по умолчанию `firstvds.ru`, потому что лучше всего работает домен из той же сети,
-что и сервер: ТСПУ режет Reality с «чужим» SNI вроде www.microsoft.com на российском IP хостинга.
-Если хостинг другой, подберите сайт из его сети с поддержкой TLS 1.3 и h2.
+**SNI (`REALITY_SNI`)** подбирается автоматически. ТСПУ режет Reality с «чужим» SNI вроде www.microsoft.com
+на российском IP хостинга, поэтому нужен сайт из той же сети, что и сервер. Сначала скрипт смотрит таблицу
+проверенных хостингов (для FirstVDS это `firstvds.ru`), затем сканирует соседние адреса в /24 и ищет сайт
+с TLS 1.3, h2 и валидным сертификатом, домен которого указывает ровно на этот адрес. Если ничего не нашлось,
+скрипт остановится и попросит указать `REALITY_SNI=домен` вручную. Все остальные шаги к этому моменту уже
+выполнены, поэтому повторный запуск проходит быстро.
 
-Необязательные переменные: `INBOUND_PORT`, `REALITY_SNI`, `TRANSPORT` (`xhttp`/`tcp`), `XUI_USERNAME`, `XUI_PASSWORD`,
-`XUI_PANEL_PORT`, `XUI_WEB_BASE_PATH`, `XUI_SSL_MODE` (`none`/`ip`/`domain`), `KILL_SWITCH`,
-`DISABLE_IPV6`, `SET_DNS`. Их описание есть в шапке скрипта.
+### L2TP/IPsec для клиентов
+Сервер, PSK, логин и пароль печатаются в конце установки. Их можно задать заранее через `L2TP_PSK`,
+`L2TP_USER` и `L2TP_PASSWORD`, а отключить L2TP можно через `L2TP_SERVER=0`.
+
+- **Android 12+** больше не поддерживает L2TP, для него используйте ссылку VLESS.
+- **Windows** по умолчанию не подключается к L2TP-серверу за NAT. Выполните один раз от администратора
+  и перезагрузитесь:
+  ```
+  reg add HKLM\SYSTEM\CurrentControlSet\Services\PolicyAgent /v AssumeUDPEncapsulationContextOnSendRule /t REG_DWORD /d 2 /f
+  ```
+- Клиенты получают адреса `192.168.50.10–250`. DNS у них 1.1.1.1/8.8.8.8, и запросы идут через туннель.
+- В файрволе провайдера сервера №1 должны быть открыты **UDP 500 и 4500**.
+
+Необязательные переменные: `INBOUND_PORT`, `REALITY_SNI`, `TRANSPORT` (`xhttp`/`tcp`), `XUI_VERSION`,
+`XUI_USERNAME`, `XUI_PASSWORD`, `XUI_PANEL_PORT`, `XUI_WEB_BASE_PATH`, `XUI_SSL_MODE` (`none`/`ip`/`domain`),
+`L2TP_SERVER`, `L2TP_PSK`, `L2TP_USER`, `L2TP_PASSWORD`, `KILL_SWITCH`, `DISABLE_IPV6`, `SET_DNS`.
+Их описание есть в шапке скрипта.
 
 ### Что по умолчанию меняется на сервере №1
 - **Kill switch** (`KILL_SWITCH=1`): если туннель упал, сервер не выходит в интернет напрямую.

@@ -8,15 +8,18 @@
 #    туннель, а ответы на входящие соединения (SSH, клиенты, панель) — напрямую.
 #    Туннель поддерживается systemd-сервисом l2tp-exit (автопереподключение).
 # 3. Ставит 3x-ui, создаёт inbound VLESS + Reality и печатает данные доступа.
+# 4. (L2TP_SERVER=1) Поднимает L2TP/IPsec сервер для обычных клиентов (Windows,
+#    macOS, iOS, роутеры), их трафик тоже уходит через сервер №2.
 #
 # Обязательные переменные (их печатает exit-server.sh):
 #   VPN_SERVER_IP  VPN_IPSEC_PSK  VPN_USER  VPN_PASSWORD
 #
 # Необязательные:
 #   INBOUND_PORT=443                 порт VLESS Reality
-#   REALITY_SNI=firstvds.ru          домен для маскировки Reality. Лучше всего сайт из
-#                                    той же сети (AS), что и сервер: для FirstVDS это
-#                                    firstvds.ru. Для другого хостинга подберите свой.
+#   REALITY_SNI=<авто>               домен для маскировки Reality. По умолчанию ищется
+#                                    автоматически: сайт из той же сети, что и сервер
+#                                    (TLS 1.3 + h2, валидный сертификат). ТСПУ режет
+#                                    Reality с «чужим» SNI на российском IP хостинга.
 #   TRANSPORT=xhttp                  xhttp (стабильнее через ТСПУ) | tcp (Vision)
 #   INBOUND_REMARK=vless-reality     имя inbound в панели
 #   XUI_USERNAME / XUI_PASSWORD      логин/пароль панели (иначе случайные)
@@ -26,6 +29,9 @@
 #   KILL_SWITCH=1                    при падении туннеля не выпускать трафик напрямую
 #   DISABLE_IPV6=1                   выключить IPv6 (туннель только IPv4, иначе утечки)
 #   SET_DNS=1                        резолвер 1.1.1.1/8.8.8.8 (запросы идут через туннель)
+#   XUI_VERSION=v3.8.5               версия 3x-ui (проверенная; latest — на свой риск)
+#   L2TP_SERVER=1                    L2TP/IPsec сервер на этом узле (0 — не ставить)
+#   L2TP_PSK / L2TP_USER / L2TP_PASSWORD  данные для L2TP-клиентов (иначе случайные)
 #
 # Повторный запуск безопасен: конфиги перезаписываются, существующий inbound
 # и учётные данные панели переиспользуются.
@@ -37,7 +43,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
-SCRIPT_VERSION=7
+SCRIPT_VERSION=8
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -48,6 +54,54 @@ rand() {
     local s
     s=$(openssl rand -base64 96 | tr -dc 'A-Za-z0-9')
     printf '%s' "${s:0:$1}"
+}
+
+# Годится ли домен как цель Reality: TLS 1.3 + h2 + валидный сертификат
+sni_check() {
+    timeout 6 openssl s_client -connect "$1:443" -servername "$1" -tls1_3 -alpn h2 \
+        -verify_return_error -CApath /etc/ssl/certs </dev/null 2>/dev/null | grep -q 'ALPN protocol: h2'
+}
+
+# Проверяет один адрес: берёт имена из сертификата и оставляет то, которое
+# резолвится ровно в этот адрес и проходит sni_check
+sni_probe() {
+    local ip=$1 out n
+    out=$(timeout 5 openssl s_client -connect "$ip:443" -tls1_3 -alpn h2 </dev/null 2>/dev/null) || return 0
+    grep -q 'ALPN protocol: h2' <<<"$out" || return 0
+    for n in $(openssl x509 -noout -text 2>/dev/null <<<"$out" | grep -o 'DNS:[^,]*' | cut -d: -f2 | grep -v '^\*' | head -n 8); do
+        getent ahostsv4 "$n" | awk '{print $1}' | grep -qx "$ip" || continue
+        sni_check "$n" || continue
+        echo "$n"
+        return 0
+    done
+    return 0
+}
+export -f sni_check sni_probe
+
+# SNI для Reality: сайт из той же сети, что и сервер. Для ТСПУ такой SNI на этом
+# IP выглядит естественно, а «чужой» (www.microsoft.com и т.п.) — нет.
+pick_sni() {
+    local asn cand base
+    asn=$(curl -fsS --max-time 10 "https://stat.ripe.net/data/network-info/data.json?resource=$PUBLIC_IP" 2>/dev/null \
+        | jq -r '.data.asns[0] // empty' 2>/dev/null) || asn=""
+    # Проверенные вручную варианты для известных хостингов
+    case $asn in
+        29182) cand=firstvds.ru ;;   # FirstVDS
+        *) cand="" ;;
+    esac
+    if [[ -n $cand ]] && sni_check "$cand"; then
+        echo "$cand"
+        return 0
+    fi
+    base=${PUBLIC_IP%.*}
+    log "Ищу домен для Reality среди соседних адресов $base.0/24 (AS${asn:-?}), до минуты ..." >&2
+    cand=$(seq 1 254 | grep -vx "${PUBLIC_IP##*.}" \
+        | xargs -P 32 -I{} bash -c "sni_probe $base.{}" 2>/dev/null \
+        | sort -u \
+        | grep -viE 'vpn|proxy|xray|v2ray|vless|trojan|panel|test|dev|mail|autodiscover|ydns|fvds|xn--' \
+        | awk '{print length($0), $0}' | sort -n | awk 'NR==1{print $2}') || true
+    [[ -n $cand ]] && echo "$cand"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -67,7 +121,7 @@ for v in "$VPN_IPSEC_PSK" "$VPN_USER" "$VPN_PASSWORD"; do
 done
 
 INBOUND_PORT=${INBOUND_PORT:-443}
-REALITY_SNI=${REALITY_SNI:-firstvds.ru}
+REALITY_SNI=${REALITY_SNI:-}
 TRANSPORT=${TRANSPORT:-xhttp}
 [[ $TRANSPORT == xhttp || $TRANSPORT == tcp ]] || die "TRANSPORT должен быть xhttp или tcp"
 INBOUND_REMARK=${INBOUND_REMARK:-vless-reality}
@@ -75,6 +129,9 @@ XUI_SSL_MODE=${XUI_SSL_MODE:-none}
 KILL_SWITCH=${KILL_SWITCH:-1}
 DISABLE_IPV6=${DISABLE_IPV6:-1}
 SET_DNS=${SET_DNS:-1}
+XUI_VERSION=${XUI_VERSION:-v3.8.5}
+L2TP_SERVER=${L2TP_SERVER:-1}
+L2TP_NET=192.168.50
 
 mkdir -p "$CONF_DIR"
 chmod 700 "$CONF_DIR"
@@ -91,6 +148,21 @@ XUI_USERNAME=${XUI_USERNAME:-${saved_user:-$(rand 10)}}
 XUI_PASSWORD=${XUI_PASSWORD:-${saved_pass:-$(rand 16)}}
 XUI_WEB_BASE_PATH=${XUI_WEB_BASE_PATH:-${saved_path:-$(rand 18)}}
 XUI_WEB_BASE_PATH=${XUI_WEB_BASE_PATH#/}; XUI_WEB_BASE_PATH=${XUI_WEB_BASE_PATH%/}
+# Данные L2TP-сервера: env > сохранённые > случайные
+if [[ -f $CONF_DIR/l2tp-server.env ]]; then
+    # shellcheck disable=SC1091
+    { saved_l2psk=$(. "$CONF_DIR/l2tp-server.env"; echo "$L2TP_PSK")
+      saved_l2user=$(. "$CONF_DIR/l2tp-server.env"; echo "$L2TP_USER")
+      saved_l2pass=$(. "$CONF_DIR/l2tp-server.env"; echo "$L2TP_PASSWORD"); }
+fi
+L2TP_PSK=${L2TP_PSK:-${saved_l2psk:-$(rand 24)}}
+L2TP_USER=${L2TP_USER:-${saved_l2user:-vpn}}
+L2TP_PASSWORD=${L2TP_PASSWORD:-${saved_l2pass:-$(rand 16)}}
+for v in "$L2TP_PSK" "$L2TP_USER" "$L2TP_PASSWORD"; do
+    [[ $v =~ ^[A-Za-z0-9._@-]+$ ]] || die "L2TP логин/пароль/PSK: только латиница, цифры и . _ @ -"
+done
+[[ $L2TP_PSK == "$VPN_IPSEC_PSK" ]] && die "L2TP_PSK должен отличаться от PSK сервера №2"
+
 if [[ -z ${XUI_PANEL_PORT:-} ]]; then
     XUI_PANEL_PORT=${saved_port:-}
     while [[ -z $XUI_PANEL_PORT || $XUI_PANEL_PORT == "$INBOUND_PORT" ]]; do
@@ -132,7 +204,7 @@ if dpkg -s strongswan-starter >/dev/null 2>&1; then
 fi
 apt-get install -y -qq \
     charon-systemd strongswan-swanctl libstrongswan-standard-plugins \
-    xl2tpd ppp iproute2 curl jq openssl qrencode ca-certificates >/dev/null
+    xl2tpd ppp iproute2 iptables curl jq openssl qrencode ca-certificates >/dev/null
 
 SWAN_UNIT=""
 for u in strongswan.service strongswan-swanctl.service; do
@@ -146,6 +218,46 @@ done
 
 log "Настраиваю IPsec/L2TP клиент до $VPN_SERVER_IP ..."
 umask 077
+
+# L2TP-сервер для своих клиентов живёт в том же charon и том же xl2tpd:
+# второй IPsec-демон (например, Libreswan от hwdsl2) конфликтовал бы за UDP 500/4500.
+# PSK у клиентов свой, поэтому у секрета аплинка указан id сервера №2 —
+# иначе charon не смог бы выбрать нужный PSK.
+if [[ $L2TP_SERVER == 1 ]]; then
+    UPLINK_SECRET_ID="id-uplink = $VPN_SERVER_IP"
+    SERVER_CONN="
+    l2tp-server {
+        version = 1
+        remote_addrs = %any
+        proposals = aes256-sha256-modp2048,aes128-sha256-modp2048,aes256-sha1-modp2048,aes128-sha1-modp2048,aes256-sha256-modp1024,aes256-sha1-modp1024,aes128-sha1-modp1024
+        dpd_delay = 30s
+        rekey_time = 0s
+        local {
+            auth = psk
+        }
+        remote {
+            auth = psk
+        }
+        children {
+            l2tp-server {
+                mode = transport
+                local_ts = dynamic[udp/1701]
+                remote_ts = dynamic[udp]
+                esp_proposals = aes256-sha256,aes128-sha256,aes256-sha1,aes128-sha1
+                dpd_action = clear
+                rekey_time = 0s
+            }
+        }
+    }"
+    SERVER_SECRET="
+    ike-l2tp-server {
+        secret = \"$L2TP_PSK\"
+    }"
+else
+    UPLINK_SECRET_ID=""
+    SERVER_CONN=""
+    SERVER_SECRET=""
+fi
 
 # Алгоритмы подобраны под Libreswan-конфиг hwdsl2 (ike=aes256-sha2;modp2048,...)
 cat > /etc/swanctl/conf.d/$CONN.conf <<EOF
@@ -171,26 +283,74 @@ connections {
                 start_action = none
             }
         }
-    }
+    }$SERVER_CONN
 }
 
 secrets {
     ike-$CONN {
+        $UPLINK_SECRET_ID
         secret = "$VPN_IPSEC_PSK"
-    }
+    }$SERVER_SECRET
 }
 EOF
 chmod 600 /etc/swanctl/conf.d/$CONN.conf
 
 [[ -f /etc/xl2tpd/xl2tpd.conf && ! -f /etc/xl2tpd/xl2tpd.conf.orig ]] \
     && cp /etc/xl2tpd/xl2tpd.conf /etc/xl2tpd/xl2tpd.conf.orig
-cat > /etc/xl2tpd/xl2tpd.conf <<EOF
+{
+if [[ $L2TP_SERVER == 1 ]]; then
+cat <<EOF
+[lns default]
+ip range = $L2TP_NET.10-$L2TP_NET.250
+local ip = $L2TP_NET.1
+require chap = yes
+refuse pap = yes
+require authentication = yes
+name = l2tpd
+pppoptfile = /etc/ppp/options.l2tp-server
+length bit = yes
+
+EOF
+fi
+cat <<EOF
 [lac $CONN]
 lns = $VPN_SERVER_IP
 ppp debug = no
 pppoptfile = /etc/ppp/options.$CONN
 length bit = yes
 EOF
+} > /etc/xl2tpd/xl2tpd.conf
+
+if [[ $L2TP_SERVER == 1 ]]; then
+    cat > /etc/ppp/options.l2tp-server <<EOF
++mschap-v2
+require-mschap-v2
+ipcp-accept-local
+ipcp-accept-remote
+noccp
+auth
+mtu 1280
+mru 1280
+proxyarp
+lcp-echo-failure 4
+lcp-echo-interval 30
+connect-delay 5000
+ms-dns 1.1.1.1
+ms-dns 8.8.8.8
+EOF
+    # Наша строка в chap-secrets помечена комментарием, чужие не трогаем
+    touch /etc/ppp/chap-secrets
+    sed -i '/# l2tp-exit-server$/d' /etc/ppp/chap-secrets
+    printf '"%s" l2tpd "%s" * # l2tp-exit-server\n' "$L2TP_USER" "$L2TP_PASSWORD" >> /etc/ppp/chap-secrets
+    chmod 600 /etc/ppp/chap-secrets
+    cat > $CONF_DIR/l2tp-server.env <<EOF
+L2TP_PSK='$L2TP_PSK'
+L2TP_USER='$L2TP_USER'
+L2TP_PASSWORD='$L2TP_PASSWORD'
+EOF
+else
+    sed -i '/# l2tp-exit-server$/d' /etc/ppp/chap-secrets 2>/dev/null || true
+fi
 
 # Маршруты pppd не трогает (nodefaultroute) — ими управляет $HELPER.
 # ipparam позволяет хукам ip-up/ip-down узнать «свой» интерфейс.
@@ -220,6 +380,8 @@ cat > $CONF_DIR/$CONN.env <<EOF
 VPN_SERVER_IP=$VPN_SERVER_IP
 KILL_SWITCH=$KILL_SWITCH
 SWAN_UNIT=$SWAN_UNIT
+L2TP_SERVER=$L2TP_SERVER
+L2TP_NET=$L2TP_NET
 EOF
 
 cat > /etc/ppp/ip-up.d/$CONN <<'EOF'
@@ -309,6 +471,37 @@ apply_routes() {
     echo "$sig" > $SIG_FILE
 }
 
+# Правила для L2TP-клиентов этого сервера (идемпотентно, помечены комментарием)
+fw() {
+    local t=$1 c=$2; shift 2
+    iptables -w -t "$t" -C "$c" "$@" -m comment --comment l2tp-exit 2>/dev/null \
+        || iptables -w -t "$t" -I "$c" 1 "$@" -m comment --comment l2tp-exit
+}
+
+fw_rules() {
+    local net="$L2TP_NET.0/24"
+    # NAT только в ppp-интерфейсы: если туннель лёг, трафик клиентов
+    # не уйдёт напрямую через провайдера сервера №1
+    fw nat POSTROUTING -s "$net" ! -d "$net" -o ppp+ -j MASQUERADE
+    fw filter FORWARD -s "$net" -j ACCEPT
+    fw filter FORWARD -d "$net" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    fw mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    # L2TP принимаем только внутри IPsec
+    fw filter INPUT -p udp --dport 1701 -m policy --dir in --pol none -j DROP
+}
+
+remove_fw() {
+    local t line
+    for t in nat filter mangle; do
+        iptables -w -t "$t" -S 2>/dev/null | grep -- '--comment l2tp-exit' | sed 's/^-A /-D /' \
+            | while read -r line; do eval iptables -w -t "$t" "$line"; done
+    done
+}
+
+apply_fw() {
+    if [ "${L2TP_SERVER:-0}" = "1" ]; then fw_rules 2>/dev/null || log "не все правила iptables применились"; else remove_fw; fi
+}
+
 remove_routes() {
     flush_rules
     ip route flush table 201 2>/dev/null   # от старых версий скрипта
@@ -353,6 +546,7 @@ watch() {
     swanctl --load-all --noprompt >/dev/null 2>&1
     while :; do
         apply_routes
+        apply_fw
         if is_up; then
             fails=0
         else
@@ -377,11 +571,14 @@ status() {
     echo "--- PPP";   if is_up; then ip -4 addr show dev "$(cat $IFACE_FILE)"; else echo "down"; fi
     echo "--- rules"; ip -4 rule show | grep -E '^(999|100[0-3]):'
     echo "--- table $T_TUN";    ip route show table $T_TUN
+    if [ "${L2TP_SERVER:-0}" = "1" ]; then
+        echo "--- L2TP-клиенты"; swanctl --list-sas --ike l2tp-server 2>/dev/null | grep -E '^l2tp-server' || echo "нет"
+    fi
     echo "--- exit IP"; curl -4 -s --max-time 8 https://ipv4.icanhazip.com || echo "недоступно"
 }
 
 case "${1:-}" in
-    routes) apply_routes ;;
+    routes) apply_routes; apply_fw ;;
     watch)  watch ;;
     status) status ;;
     down)
@@ -389,6 +586,7 @@ case "${1:-}" in
         ctl "d $CONN"
         swanctl --terminate --ike $CONN >/dev/null 2>&1
         remove_routes
+        remove_fw
         log "туннель остановлен, маршрутизация возвращена к исходной"
         ;;
     *) echo "usage: $0 {status|down|routes|watch}"; exit 1 ;;
@@ -412,12 +610,17 @@ WantedBy=multi-user.target
 EOF
 
 # ---------------------------------------------------------------------------
-# sysctl: IPv6 и rp_filter
+# sysctl: IPv6, rp_filter, форвардинг для L2TP-клиентов
 # ---------------------------------------------------------------------------
 
 {
     echo "net.ipv4.conf.all.rp_filter = 2"
     echo "net.ipv4.conf.default.rp_filter = 2"
+    if [[ $L2TP_SERVER == 1 ]]; then
+        echo "net.ipv4.ip_forward = 1"
+        echo "net.ipv4.conf.all.accept_redirects = 0"
+        echo "net.ipv4.conf.all.send_redirects = 0"
+    fi
     if [[ $DISABLE_IPV6 == 1 ]]; then
         # L2TP-туннель только IPv4: без этого Xray уходил бы в IPv6 напрямую
         echo "net.ipv6.conf.all.disable_ipv6 = 1"
@@ -508,14 +711,16 @@ fi
 # ---------------------------------------------------------------------------
 
 if [[ ! -x $XUI_DIR/x-ui ]]; then
-    log "Устанавливаю 3x-ui ..."
-    curl -fsSL --retry 3 https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh -o /tmp/3x-ui-install.sh \
-        || die "Не удалось скачать install.sh 3x-ui"
+    # Версия закреплена: API 3x-ui меняется между релизами (так уже ломалось поле tgId)
+    if [[ $XUI_VERSION == latest ]]; then xui_ref=main; xui_arg=""; else xui_ref=$XUI_VERSION; xui_arg=$XUI_VERSION; fi
+    log "Устанавливаю 3x-ui ${xui_arg:-latest} ..."
+    curl -fsSL --retry 3 "https://raw.githubusercontent.com/MHSanaei/3x-ui/$xui_ref/install.sh" -o /tmp/3x-ui-install.sh \
+        || die "Не удалось скачать install.sh 3x-ui ($xui_ref)"
     XUI_NONINTERACTIVE=1 \
     XUI_USERNAME="$XUI_USERNAME" XUI_PASSWORD="$XUI_PASSWORD" \
     XUI_PANEL_PORT="$XUI_PANEL_PORT" XUI_WEB_BASE_PATH="$XUI_WEB_BASE_PATH" \
     XUI_SSL_MODE="$XUI_SSL_MODE" XUI_SERVER_IP="$PUBLIC_IP" \
-        bash /tmp/3x-ui-install.sh </dev/null || die "Установка 3x-ui завершилась с ошибкой"
+        bash /tmp/3x-ui-install.sh $xui_arg </dev/null || die "Установка 3x-ui завершилась с ошибкой"
     rm -f /tmp/3x-ui-install.sh
 else
     log "3x-ui уже установлен, пропускаю установку."
@@ -582,6 +787,8 @@ existing=$(jq -c --arg r "$INBOUND_REMARK" '[.obj[]? | select(.remark==$r)][0] /
 if [[ -n $existing ]]; then
     ex_net=$(jq -r "$JQ_DEFS"' .streamSettings | j | .network' <<<"$existing")
     ex_sni=$(jq -r "$JQ_DEFS"' .streamSettings | j | .realitySettings.serverNames[0]' <<<"$existing")
+    # Без явного REALITY_SNI сохраняем SNI существующего inbound
+    [[ -z $REALITY_SNI ]] && REALITY_SNI=$ex_sni
     if [[ $ex_net != "$TRANSPORT" || $ex_sni != "$REALITY_SNI" ]]; then
         log "Inbound '$INBOUND_REMARK' ($ex_net, SNI $ex_sni) пересоздаю как $TRANSPORT, SNI $REALITY_SNI — ссылка изменится."
         old_port=$(jq -r '.port' <<<"$existing")
@@ -602,6 +809,13 @@ if [[ -n $existing ]]; then
     SID=$(jq -r "$JQ_DEFS"' .streamSettings | j | .realitySettings.shortIds[0]' <<<"$existing")
     XHTTP_PATH=$(jq -r "$JQ_DEFS"' .streamSettings | j | .xhttpSettings.path // "/"' <<<"$existing")
 else
+    if [[ -z $REALITY_SNI ]]; then
+        REALITY_SNI=$(pick_sni)
+        [[ -n $REALITY_SNI ]] || die "Не нашёл подходящий домен для Reality в сети сервера.
+  Подберите сайт, который хостится у того же провайдера (TLS 1.3 + h2), и перезапустите
+  скрипт с REALITY_SNI=домен. Всё остальное уже настроено, повторный запуск быстрый."
+        log "Домен для Reality: $REALITY_SNI"
+    fi
     log "Создаю inbound VLESS + Reality ($TRANSPORT, SNI $REALITY_SNI) на порту $INBOUND_PORT ..."
     if ss -Hltn "sport = :$INBOUND_PORT" | grep -q .; then
         die "Порт $INBOUND_PORT уже занят. Задайте другой через INBOUND_PORT=..."
@@ -674,6 +888,10 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active
     log "ufw активен — открываю порты $INBOUND_PORT и $XUI_PANEL_PORT"
     ufw allow "$INBOUND_PORT/tcp" >/dev/null
     ufw allow "$XUI_PANEL_PORT/tcp" >/dev/null
+    if [[ $L2TP_SERVER == 1 ]]; then
+        ufw allow 500/udp >/dev/null
+        ufw allow 4500/udp >/dev/null
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -700,6 +918,16 @@ summary() {
     echo
     echo "  $VLESS_LINK"
     echo
+    if [[ $L2TP_SERVER == 1 ]]; then
+        echo "================ L2TP/IPsec (Windows, macOS, iOS, роутеры) ================"
+        echo "  Сервер   : $PUBLIC_IP"
+        echo "  IPsec PSK: $L2TP_PSK"
+        echo "  Логин    : $L2TP_USER"
+        echo "  Пароль   : $L2TP_PASSWORD"
+        echo "  (Android 12+ не умеет L2TP — для него ссылка VLESS выше. Windows за NAT:"
+        echo "   нужен ключ реестра AssumeUDPEncapsulationContextOnSendRule=2, см. README)"
+        echo
+    fi
     echo "================ Туннель ================"
     echo "  Выходной сервер : $VPN_SERVER_IP"
     echo "  Внешний IP      : ${EXIT_IP:-?}"
