@@ -49,7 +49,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
-SCRIPT_VERSION=16-multi
+SCRIPT_VERSION=18-multi
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -308,19 +308,27 @@ exit_names() {
 
 uplinks() { echo main; exit_names; }
 
-# load_uplink <имя>: U_CONN U_IP U_PSK U_USER U_PASS U_TABLE U_MARK U_IFACE_FILE U_TITLE U_PORT
+# load_uplink <имя>: U_CONN U_IP U_PSK U_USER U_PASS U_TABLE U_MARK U_IFACE_FILE U_TITLE U_PORT U_INBOUND_ID
 load_uplink() {
     if [ "$1" = main ]; then
         U_CONN=$CONN; U_IP=$VPN_SERVER_IP; U_PSK=$VPN_IPSEC_PSK; U_USER=$VPN_USER; U_PASS=$VPN_PASSWORD
         U_TABLE=$T_TUN; U_MARK=""; U_IFACE_FILE=$IFACE_FILE; U_TITLE=${MAIN_TITLE:-Основной}; U_PORT=""
+        U_INBOUND_ID=${MAIN_INBOUND_ID:-}
         return 0
     fi
     [ -f "$EXITS_DIR/$1.env" ] || return 1
-    local NAME TITLE SERVER_IP PSK USER PASSWORD INDEX PORT
+    local NAME TITLE SERVER_IP PSK USER PASSWORD INDEX PORT INBOUND_ID=""
     . "$EXITS_DIR/$1.env"
     U_CONN=$CONN-$1; U_IP=$SERVER_IP; U_PSK=$PSK; U_USER=$USER; U_PASS=$PASSWORD
     U_TABLE=$((T_TUN + INDEX)); U_MARK=$((MARK_BASE + INDEX))
-    U_IFACE_FILE=/run/$CONN-$1.iface; U_TITLE=$TITLE; U_PORT=$PORT
+    U_IFACE_FILE=/run/$CONN-$1.iface; U_TITLE=$TITLE; U_PORT=$PORT; U_INBOUND_ID=$INBOUND_ID
+}
+
+# set_var <файл> <КЛЮЧ> <значение>: заменить или добавить строку КЛЮЧ='значение'
+set_var() {
+    local f=$1 k=$2 v=$3
+    sed -i "/^$k=/d" "$f"
+    printf "%s='%s'\n" "$k" "$v" >> "$f"
 }
 
 # Имя выхода по имени IPsec/L2TP-соединения (для ip-up/ip-down)
@@ -806,51 +814,63 @@ xui_init() {
 
 JQ_J='def j: if type=="string" then (fromjson? // {}) else (. // {}) end;'
 
+# Inbound по id (переименование в панели не должно ломать скрипт), иначе по
+# имени, иначе по порту (для установок, где id ещё не был сохранён)
+find_inbound() {  # <list-json> <id> <remark> [port]
+    echo "$1" | jq -c --arg id "$2" --arg r "$3" --arg p "${4:-}" '
+        ([.obj[]? | select(($id != "") and ((.id | tostring) == $id))][0])
+        // ([.obj[]? | select(.remark == $r)][0])
+        // ([.obj[]? | select(($p != "") and ((.port | tostring) == $p))][0]) // empty'
+}
+
 # Для каждого выхода — копия основного inbound на своём порту (inbound
 # «exit-<имя>», тот же subId клиента: одна подписка на все выходы), плюс в
 # шаблоне Xray исходящий канал с меткой выхода и правило «inbound → канал».
 xray_sync() {
-    local list main u remark have payload resp tmpl new exits="[]" tag
+    local list main u remark have payload resp tmpl new exits="[]" tag ib
     xui_init || return 1
     list=$(xui_api GET /panel/api/inbounds/list)
     echo "$list" | jq -e '.success' >/dev/null 2>&1 || { log "API 3x-ui не отвечает"; return 1; }
-    main=$(echo "$list" | jq -c --arg r "${MAIN_INBOUND_REMARK:-vless-reality}" '[.obj[]? | select(.remark==$r)][0] // empty')
-    [ -n "$main" ] || { log "нет основного inbound ${MAIN_INBOUND_REMARK:-vless-reality}"; return 1; }
+    main=$(find_inbound "$list" "${MAIN_INBOUND_ID:-}" "${MAIN_INBOUND_REMARK:-vless-reality}" 443)
+    [ -n "$main" ] || { log "нет основного inbound (id ${MAIN_INBOUND_ID:-?}, ${MAIN_INBOUND_REMARK:-vless-reality})"; return 1; }
+    [ -n "${MAIN_INBOUND_ID:-}" ] || set_var $CONF_DIR/l2tp-exit.env MAIN_INBOUND_ID "$(echo "$main" | jq -r .id)"
 
     for u in $(exit_names); do
         load_uplink "$u" || continue
         remark="exit-$u"
-        have=$(echo "$list" | jq -r --arg r "$remark" '[.obj[]? | select(.remark==$r)][0].port // empty')
-        if [ -n "$have" ] && [ "$have" != "$U_PORT" ]; then
-            xui_api POST "/panel/api/inbounds/del/$(echo "$list" | jq -r --arg r "$remark" '[.obj[]? | select(.remark==$r)][0].id')" >/dev/null
-            have=""
+        ib=$(find_inbound "$list" "$U_INBOUND_ID" "$remark" "$U_PORT")
+        if [ -n "$ib" ]; then
+            # Порт и имя можно менять в панели — принимаем их, а не пересоздаём
+            have=$(echo "$ib" | jq -r .port)
+            if [ "$have" != "$U_PORT" ]; then
+                set_var "$EXITS_DIR/$u.env" PORT "$have"
+                log "[$u] порт подключения изменён в панели: $U_PORT → $have"
+            fi
+            [ -n "$U_INBOUND_ID" ] || set_var "$EXITS_DIR/$u.env" INBOUND_ID "$(echo "$ib" | jq -r .id)"
+            continue
         fi
-        if [ -z "$have" ]; then
-            payload=$(echo "$main" | jq -c --arg r "$remark" --argjson port "$U_PORT" \
-                --arg id "$(cat /proc/sys/kernel/random/uuid)" --arg email "$remark-$(openssl rand -hex 3)" \
-                --arg path "/$(openssl rand -hex 6)" "$JQ_J"'
-                {enable: true, remark: $r, listen: "", port: $port, protocol: .protocol,
-                 expiryTime: 0, total: 0, up: 0, down: 0,
-                 settings: (.settings | j | .clients = [(.clients[0] // {}) + {id: $id, email: $email}]
-                            | .clients[0] |= del(.created_at, .updated_at)),
-                 streamSettings: (.streamSettings | j
-                            | if .network == "xhttp" then .xhttpSettings.path = $path else . end),
-                 sniffing: (.sniffing | j)}')
-            resp=$(xui_api POST /panel/api/inbounds/add "$payload")
-            echo "$resp" | jq -e '.success' >/dev/null 2>&1 || { log "[$u] не удалось создать inbound: $resp"; return 1; }
-            log "[$u] создан inbound $remark на порту $U_PORT"
-        fi
-    done
-    # inbound'ы удалённых выходов
-    for id in $(echo "$list" | jq -r '.obj[]? | select(.remark|startswith("exit-")) | "\(.id) \(.remark)"' \
-        | while read -r id r; do [ -f "$EXITS_DIR/${r#exit-}.env" ] || echo "$id"; done); do
-        xui_api POST "/panel/api/inbounds/del/$id" >/dev/null
+        payload=$(echo "$main" | jq -c --arg r "$remark" --argjson port "$U_PORT" \
+            --arg id "$(cat /proc/sys/kernel/random/uuid)" --arg email "$remark-$(openssl rand -hex 3)" \
+            --arg path "/$(openssl rand -hex 6)" "$JQ_J"'
+            {enable: true, remark: $r, listen: "", port: $port, protocol: .protocol,
+             expiryTime: 0, total: 0, up: 0, down: 0,
+             settings: (.settings | j | .clients = [(.clients[0] // {}) + {id: $id, email: $email}]
+                        | .clients[0] |= del(.created_at, .updated_at)),
+             streamSettings: (.streamSettings | j
+                        | if .network == "xhttp" then .xhttpSettings.path = $path else . end),
+             sniffing: (.sniffing | j)}')
+        resp=$(xui_api POST /panel/api/inbounds/add "$payload")
+        echo "$resp" | jq -e '.success' >/dev/null 2>&1 || { log "[$u] не удалось создать inbound: $resp"; return 1; }
+        list=$(xui_api GET /panel/api/inbounds/list)
+        ib=$(echo "$list" | jq -c --arg r "$remark" --argjson p "$U_PORT" '[.obj[]? | select(.remark == $r and .port == $p)][0] // empty')
+        [ -n "$ib" ] && set_var "$EXITS_DIR/$u.env" INBOUND_ID "$(echo "$ib" | jq -r .id)"
+        log "[$u] создан inbound $remark на порту $U_PORT"
     done
 
     list=$(xui_api GET /panel/api/inbounds/list)
     for u in $(exit_names); do
         load_uplink "$u" || continue
-        tag=$(echo "$list" | jq -r --arg r "exit-$u" '[.obj[]? | select(.remark==$r)][0].tag // empty')
+        tag=$(find_inbound "$list" "$U_INBOUND_ID" "exit-$u" "$U_PORT" | jq -r '.tag // empty')
         [ -n "$tag" ] || { log "[$u] не найден тег inbound"; return 1; }
         exits=$(echo "$exits" | jq -c --arg n "$u" --arg t "$tag" --argjson m "$U_MARK" '. + [{name: $n, tag: $t, mark: $m}]')
     done
@@ -866,7 +886,12 @@ xray_sync() {
                       + [$ex[] | {tag: ("exit-" + .name), protocol: "freedom",
                                   settings: {domainStrategy: "AsIs"},
                                   streamSettings: {sockopt: {mark: .mark}}}])
-        | .routing.rules = ([.routing.rules[]? | select((.ruleTag // "") | startswith("l2tp-exit-") | not)]
+        # Чужие (ручные) правила, ведущие в удалённый выход, тоже убираем:
+        # ссылка на несуществующий outbound не даст Xray запуститься
+        | ([$ex[] | "exit-" + .name]) as $live
+        | .routing.rules = ([.routing.rules[]? | select((.ruleTag // "") | startswith("l2tp-exit-") | not)
+                             | select(((.outboundTag // "") | startswith("exit-") | not)
+                                      or (.outboundTag as $o | $live | index($o)))]
                       + [$ex[] | {type: "field", ruleTag: ("l2tp-exit-" + .name),
                                   inboundTag: [.tag], outboundTag: ("exit-" + .name)}])')
     if [ "$(echo "$tmpl" | jq -S -c .)" != "$(echo "$new" | jq -S -c .)" ]; then
@@ -878,6 +903,43 @@ xray_sync() {
     fi
 }
 
+# ufw: порты подключений 3x-ui открываются и закрываются сами (раз в минуту по
+# таймеру). Закрываются только порты, которые открыл этот скрипт: их список в
+# ufw-ports. Правила, заведённые вручную, не трогаются.
+ufw_sync() {
+    local state=$CONF_DIR/ufw-ports list want rule port proto
+    command -v ufw >/dev/null 2>&1 || return 0
+    ufw status 2>/dev/null | grep -q 'Status: active' || return 0
+    xui_init >/dev/null 2>&1 || return 0
+    list=$(xui_api GET /panel/api/inbounds/list)
+    # Без ответа панели ничего не закрываем
+    echo "$list" | jq -e '.success' >/dev/null 2>&1 || return 0
+    want=$(echo "$list" | jq -r "$JQ_J"'
+        .obj[]? | select(.enable == true)
+        | select((.listen // "") | test("^(127\\.|::1$|localhost)") | not)
+        | (.settings | j) as $s | (.streamSettings | j) as $st | .protocol as $pr
+        | (if (["hysteria", "hysteria2", "tuic", "wireguard", "amneziawg"] | index($pr))
+              or (["kcp", "quic"] | index($st.network // "")) then ["udp"]
+           elif $pr == "shadowsocks" then (($s.network // "tcp,udp") | split(","))
+           else ["tcp"] end)[] as $p
+        | "\(.port)/\($p)"' | sort -u)
+    touch "$state"
+    for rule in $want; do
+        grep -qx "$rule" "$state" && continue
+        port=${rule%/*}; proto=${rule#*/}
+        # Уже открыт вручную — не наш, не запоминаем (и потом не закроем)
+        ufw status 2>/dev/null | awk '{print $1}' | grep -qx "$rule" && continue
+        ufw allow "$port/$proto" comment 'l2tp-exit: 3x-ui' >/dev/null && echo "$rule" >> "$state" \
+            && log "ufw: открыт $rule"
+    done
+    for rule in $(cat "$state"); do
+        printf '%s\n' "$want" | grep -qx "$rule" && continue
+        ufw delete allow "$rule" >/dev/null 2>&1
+        sed -i "\\#^$rule\$#d" "$state"
+        log "ufw: закрыт $rule (подключения на этом порту больше нет)"
+    done
+}
+
 # Ссылки vless:// доп. выходов (по образцу основного inbound)
 links() {
     local list u host
@@ -886,9 +948,8 @@ links() {
     list=$(xui_api GET /panel/api/inbounds/list)
     for u in $(exit_names); do
         load_uplink "$u" || continue
-        echo "$list" | jq -r --arg r "exit-$u" --arg host "$host" --arg title "$U_TITLE" "$JQ_J"'
-            [.obj[]? | select(.remark==$r)][0] // empty
-            | (.settings | j) as $s | (.streamSettings | j) as $st | $st.realitySettings as $rs
+        find_inbound "$list" "$U_INBOUND_ID" "exit-$u" "$U_PORT" | jq -r --arg host "$host" --arg title "$U_TITLE" "$JQ_J"'
+            (.settings | j) as $s | (.streamSettings | j) as $st | $st.realitySettings as $rs
             | "vless://\($s.clients[0].id)@\($host):\(.port)?type=\($st.network)&security=reality"
               + "&pbk=\($rs.settings.publicKey)&fp=\($rs.settings.fingerprint // "chrome")"
               + "&sni=\($rs.serverNames[0])&sid=\($rs.shortIds[0])&spx=%2F"
@@ -964,6 +1025,11 @@ EOF
 exit_del() {
     [ -f "$EXITS_DIR/$1.env" ] || { log "нет выхода «$1»"; return 1; }
     load_uplink "$1"
+    # Подключение выхода в 3x-ui — по id (его могли переименовать)
+    if xui_init; then
+        ib=$(find_inbound "$(xui_api GET /panel/api/inbounds/list)" "$U_INBOUND_ID" "exit-$1" "$U_PORT")
+        [ -n "$ib" ] && xui_api POST "/panel/api/inbounds/del/$(echo "$ib" | jq -r .id)" >/dev/null
+    fi
     rm -f "$EXITS_DIR/$1.env" "/etc/ppp/options.$U_CONN" "$U_IFACE_FILE"
     ip route flush table "$U_TABLE" 2>/dev/null
     apply_all
@@ -1037,6 +1103,7 @@ case "${1:-}" in
     exit-add) shift; exit_add "$@" ;;
     exit-del) exit_del "${2:-}" ;;
     xray-sync) xray_sync ;;
+    ufw-sync) ufw_sync ;;
     links) links ;;
     down)
         systemctl stop l2tp-exit 2>/dev/null
@@ -1068,6 +1135,7 @@ L2TP_PSK='$L2TP_PSK'
 L2TP_USER='$L2TP_USER'
 L2TP_PASSWORD='$L2TP_PASSWORD'
 MAIN_INBOUND_REMARK='$INBOUND_REMARK'
+MAIN_INBOUND_ID='$(saved MAIN_INBOUND_ID)'
 MAIN_TITLE='$MAIN_TITLE'
 ENTRY_HOST='$ENTRY_HOST'
 EOF
@@ -1088,6 +1156,28 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+# Раз в минуту открывать в ufw порты новых подключений 3x-ui (и закрывать
+# порты удалённых). Если ufw не включён, ничего не делает.
+cat > /etc/systemd/system/$CONN-ufw.service <<EOF
+[Unit]
+Description=Open ufw ports for 3x-ui inbounds
+
+[Service]
+Type=oneshot
+ExecStart=$HELPER ufw-sync
+EOF
+cat > /etc/systemd/system/$CONN-ufw.timer <<EOF
+[Unit]
+Description=Sync ufw with 3x-ui inbounds every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
 EOF
 
 # ---------------------------------------------------------------------------
@@ -1135,6 +1225,7 @@ systemd-run --quiet --unit=$CONN-rollback --on-active=300 \
     || warn "Не удалось поставить таймер отката"
 
 systemctl enable $CONN >/dev/null 2>&1
+systemctl enable --now $CONN-ufw.timer >/dev/null 2>&1 || true
 systemctl restart $CONN
 
 up=0
@@ -1290,7 +1381,13 @@ JQ_DEFS='def j: if type=="string" then (fromjson? // {}) else (. // {}) end;'
 
 list=$(api GET /panel/api/inbounds/list)
 jq -e '.success' >/dev/null <<<"$list" || die "API 3x-ui не отвечает: $list"
-existing=$(jq -c --arg r "$INBOUND_REMARK" '[.obj[]? | select(.remark==$r)][0] // empty' <<<"$list")
+# По id (подключение могли переименовать в панели), иначе по имени, иначе по порту
+MAIN_INBOUND_ID=$(saved MAIN_INBOUND_ID)
+existing=$(jq -c --arg id "$MAIN_INBOUND_ID" --arg r "$INBOUND_REMARK" --arg p "$INBOUND_PORT" '
+    ([.obj[]? | select(($id != "") and ((.id | tostring) == $id))][0])
+    // ([.obj[]? | select(.remark == $r)][0])
+    // ([.obj[]? | select((.port | tostring) == $p and .protocol == "vless")][0]) // empty' <<<"$list")
+[[ -n $existing ]] && INBOUND_REMARK=$(jq -r .remark <<<"$existing")
 
 if [[ -n $existing ]]; then
     ex_net=$(jq -r "$JQ_DEFS"' .streamSettings | j | .network' <<<"$existing")
@@ -1385,6 +1482,15 @@ else
         journalctl -u x-ui -n 30 --no-pager | grep -m1 'Failed to start' >&2 || true
         die "Xray не запустился с новым inbound. Удалите '$INBOUND_REMARK' в панели и пришлите ошибку выше."
     fi
+fi
+
+main_ib=$(api GET /panel/api/inbounds/list | jq -c --argjson p "$INBOUND_PORT" '[.obj[]? | select(.port == $p)][0] // empty')
+if [[ -n $main_ib ]]; then
+    # Запоминаем id: подключение могут переименовать в панели
+    main_id=$(jq -r .id <<<"$main_ib")
+    main_remark=$(jq -r '.remark | gsub("[\"'"'"'\\\\]"; "")' <<<"$main_ib")
+    sed -i '/^MAIN_INBOUND_ID=/d; /^MAIN_INBOUND_REMARK=/d' $CONF_DIR/$CONN.env
+    printf "MAIN_INBOUND_ID='%s'\nMAIN_INBOUND_REMARK='%s'\n" "$main_id" "$main_remark" >> $CONF_DIR/$CONN.env
 fi
 
 if [[ $TRANSPORT == xhttp ]]; then
