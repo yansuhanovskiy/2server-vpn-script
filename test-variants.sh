@@ -62,12 +62,12 @@ add() {
     {
       enable: true, remark: $remark, listen: "", port: $port, protocol: "vless",
       expiryTime: 0, total: 0, up: 0, down: 0,
-      settings: {
+      settings: ({
         clients: [{ id: $id, flow: $flow, email: $email, limitIp: 0, totalGB: 0,
                     expiryTime: 0, enable: true, comment: "", reset: 0 }],
         decryption: (if $dec == "" then "none" else $dec end),
         encryption: (if $encr == "" then "none" else $encr end)
-      } + (if $dec == "" then { fallbacks: [] } else {} end),
+      } + (if $dec == "" then { fallbacks: [] } else {} end)),
       streamSettings: ({
         network: $net, security: "reality", externalProxy: [],
         realitySettings: {
