@@ -49,7 +49,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
-SCRIPT_VERSION=15-multi
+SCRIPT_VERSION=16-multi
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -794,6 +794,14 @@ xui_init() {
     XUI_BASE="$scheme://127.0.0.1:$port/$path"
     XUI_TOKEN=$(/usr/local/x-ui/x-ui setting -getApiToken 2>/dev/null | grep -Eo 'apiToken: .+' | awk '{print $2}')
     [ -n "$XUI_TOKEN" ] || { log "не удалось получить API-токен 3x-ui"; return 1; }
+    # Панель могла только что перезапуститься
+    local i
+    for i in $(seq 1 15); do
+        xui_api GET /panel/api/inbounds/list 2>/dev/null | jq -e '.success' >/dev/null 2>&1 && return 0
+        sleep 2
+    done
+    log "панель 3x-ui не отвечает ($XUI_BASE)"
+    return 1
 }
 
 JQ_J='def j: if type=="string" then (fromjson? // {}) else (. // {}) end;'
@@ -1399,19 +1407,20 @@ fi
 # Итог
 # ---------------------------------------------------------------------------
 
-# Доп. выходы (exits.d): их inbound'ы и маршруты Xray — после основного inbound
-EXIT_LINKS=""
-if [[ -n $(ls $CONF_DIR/exits.d/*.env 2>/dev/null) ]]; then
-    log "Синхронизирую дополнительные выходы ..."
-    $HELPER xray-sync || warn "Не удалось настроить дополнительные выходы в 3x-ui (см. выше)"
-    EXIT_LINKS=$($HELPER links 2>/dev/null) || EXIT_LINKS=""
-fi
 
 SUB_URL=""
 if [[ -n $SUB_DOMAIN ]]; then
     log "Включаю подписку по HTTPS на $SUB_DOMAIN ..."
-    settings=$(api POST /panel/api/setting/all)
-    jq -e '.success' >/dev/null <<<"$settings" || die "Не удалось прочитать настройки панели: $settings"
+    # Панель могла только что перезапуститься — даём ей время ответить
+    settings=""
+    for _ in $(seq 1 15); do
+        settings=$(api POST /panel/api/setting/all 2>&1) || true
+        jq -e '.success' >/dev/null 2>&1 <<<"$settings" && break
+        sleep 2
+    done
+    jq -e '.success' >/dev/null 2>&1 <<<"$settings" || die "Не удалось прочитать настройки панели: ${settings:-пустой ответ}"
+    # obj может прийти JSON-строкой — приводим к объекту
+    settings=$(jq -c '.obj |= (if type=="string" then fromjson else . end)' <<<"$settings")
     new_settings=$(jq -c --arg d "$SUB_DOMAIN" --arg c "$SUB_CERT" --arg k "$SUB_KEY" \
         '.obj | .subEnable = true | .subDomain = $d | .subCertFile = $c | .subKeyFile = $k' <<<"$settings")
     resp=$(api POST /panel/api/setting/update "$new_settings")
@@ -1428,6 +1437,15 @@ if [[ -n $SUB_DOMAIN ]]; then
     # Панель теперь тоже по HTTPS — показываем её по домену
     scheme=https
     PANEL_HOST=$SUB_DOMAIN
+fi
+
+# Доп. выходы (exits.d): их inbound'ы и маршруты Xray — после основного inbound и подписки
+# (она перезапускает панель; хелпер дождётся, пока та снова ответит)
+EXIT_LINKS=""
+if [[ -n $(ls $CONF_DIR/exits.d/*.env 2>/dev/null) ]]; then
+    log "Синхронизирую дополнительные выходы ..."
+    $HELPER xray-sync || warn "Не удалось настроить дополнительные выходы в 3x-ui (см. выше)"
+    EXIT_LINKS=$($HELPER links 2>/dev/null) || EXIT_LINKS=""
 fi
 
 PANEL_URL="$scheme://${PANEL_HOST:-$PUBLIC_IP}:$XUI_PANEL_PORT/$XUI_WEB_BASE_PATH/"
