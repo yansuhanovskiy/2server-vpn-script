@@ -15,6 +15,7 @@
 #   D  8388/tcp+udp  Shadowsocks-2022
 #   E  4443/udp   Hysteria2 (QUIC)
 #   F  51820/udp  AmneziaWG (WireGuard с обфускацией против DPI)
+#   G  4444/udp   Hysteria2 + обфускация Salamander
 
 set -euo pipefail
 
@@ -136,7 +137,7 @@ add_raw() {
     done
     if [[ $ok != 1 ]]; then
         echo "[$remark] не запустился, удаляю:" >&2
-        journalctl -u x-ui -n 40 --no-pager | grep -iE 'Failed to start|error' | tail -2 >&2 || true
+        journalctl -u x-ui --since "-40s" --no-pager | grep -iE "Failed|error|:$port|hysteria|amnezia" | grep -v splithttp | tail -4 >&2 || true
         for bad in $(api GET /panel/api/inbounds/list | jq -r --arg r "$remark" '.obj[]? | select(.remark==$r) | .id'); do
             api POST "/panel/api/inbounds/del/$bad" >/dev/null
         done
@@ -202,11 +203,11 @@ add_ss() {
     add_raw $r $port tcp "$payload"
 }
 
-add_hy2() {
-    local r=test-E-hysteria2 port=4443 dir=/etc/l2tp-exit/hy2 cert key sni
+add_hy2() {  # <remark> <port> [salamander]
+    local r=$1 port=$2 obfs=${3:-} dir=/etc/l2tp-exit/hy2 cert key sni
     # Если есть сертификат от SUB_DOMAIN — берём его, иначе самоподписанный
     # (тогда в клиенте нужно разрешить insecure / «небезопасный сертификат»)
-    cert=$(ls /root/cert/*/fullchain.pem 2>/dev/null | head -n1)
+    cert=$(ls /root/cert/*/fullchain.pem 2>/dev/null | head -n1) || cert=""
     if [[ -n $cert ]]; then
         key=${cert%/fullchain.pem}/privkey.pem
         sni=$(basename "$(dirname "$cert")")
@@ -219,14 +220,15 @@ add_hy2() {
     fi
     local payload
     payload=$(jq -c --argjson c "$(client_base "$r-$(openssl rand -hex 3)")" --arg auth "$(openssl rand -hex 12)" \
-        --arg cert "$cert" --arg key "$key" --arg sni "$sni" '
+        --arg cert "$cert" --arg key "$key" --arg sni "$sni" --arg obfs "$obfs" --arg opw "$(openssl rand -hex 16)" '
         . + {settings: {version: 2, clients: [$c + {auth: $auth}]},
-             streamSettings: {network: "tcp", tcpSettings: {}, security: "tls",
+             streamSettings: ({network: "hysteria", hysteriaSettings: {version: 2, udpIdleTimeout: 60}, security: "tls",
                tlsSettings: {serverName: $sni, minVersion: "1.2", maxVersion: "1.3", cipherSuites: "",
                  rejectUnknownSni: false, disableSystemRoot: false, enableSessionResumption: false,
                  certificates: [{certificateFile: $cert, keyFile: $key, oneTimeLoading: false,
                                  usage: "encipherment", buildChain: false}],
-                 alpn: ["h3"], echServerKeys: "", settings: {fingerprint: "chrome", echConfigList: ""}}}}' \
+                 alpn: ["h3"], echServerKeys: "", settings: {fingerprint: "chrome", echConfigList: ""}}}
+               + (if $obfs == "" then {} else {finalmask: {udp: [{type: $obfs, settings: {password: $opw}}]}} end))}' \
         <<<"$(inbound_base $r $port hysteria)")
     add_raw $r $port udp "$payload"
 }
@@ -257,12 +259,13 @@ add test-B-xhttp     9443  xhttp ""               "" ""
     && add test-C-vlessenc 10443 tcp "" "$VDEC" "$VENC" \
     || echo "VLESS encryption не поддерживается этой версией панели, вариант C пропущен" >&2
 add_ss
-add_hy2
+add_hy2 test-E-hysteria2 4443
+add_hy2 test-G-hy2-salamander 4444 salamander
 add_awg
 
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
     for p in 8443 9443 10443 8388; do ufw allow "$p/tcp" >/dev/null; done
-    for p in 8388 4443 51820; do ufw allow "$p/udp" >/dev/null; done
+    for p in 8388 4443 4444 51820; do ufw allow "$p/udp" >/dev/null; done
 fi
 
 echo
@@ -273,6 +276,7 @@ echo "  C — VLESS TCP + Reality + VLESS encryption (Happ)"
 echo "  D — Shadowsocks-2022, 8388 tcp/udp      (Happ)"
 echo "  E — Hysteria2, 4443/udp                 (Happ)"
 echo "  F — AmneziaWG, 51820/udp                (приложение AmneziaVPN или AmneziaWG)"
+echo "  G — Hysteria2 + обфускация Salamander, 4444/udp (Happ)"
 [[ $HY2_SELF_SIGNED == 1 ]] && echo "  Для E сертификат самоподписанный: в клиенте включите «Allow insecure»."
 echo
 for l in "${LINKS[@]}"; do
