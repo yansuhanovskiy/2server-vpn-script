@@ -30,13 +30,16 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 TOKEN=$($XUI_DIR/x-ui setting -getApiToken 2>/dev/null | grep -Eo 'apiToken: .+' | awk '{print $2}')
 [[ -n $TOKEN ]] || die "Не удалось получить API-токен 3x-ui"
-BASE="http://127.0.0.1:$XUI_PANEL_PORT/$XUI_WEB_BASE_PATH"
+# После SUB_DOMAIN панель работает по HTTPS
+scheme=http
+$XUI_DIR/x-ui setting -getCert true 2>/dev/null | grep 'cert:' | awk -F': ' '{print $2}' | grep -q '[^[:space:]]' && scheme=https
+BASE="$scheme://127.0.0.1:$XUI_PANEL_PORT/$XUI_WEB_BASE_PATH"
 PUBLIC_IP=$(curl -4 -fsS --max-time 5 --interface "$(ip -4 route get 1.1.1.1 | grep -oP 'src \K\S+')" https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]') || true
 [[ -n $PUBLIC_IP ]] || PUBLIC_IP=$(ip -4 -o addr show scope global | awk '{split($4,a,"/"); print a[1]; exit}')
 
 api() {
     local method=$1 path=$2 data=${3:-}
-    local args=(-sS --max-time 20 -X "$method" -H "Authorization: Bearer $TOKEN" -H 'Accept: application/json')
+    local args=(-sSk --max-time 20 -X "$method" -H "Authorization: Bearer $TOKEN" -H 'Accept: application/json')
     [[ -n $data ]] && args+=(-H 'Content-Type: application/json' --data "$data")
     curl "${args[@]}" "$BASE$path"
 }
