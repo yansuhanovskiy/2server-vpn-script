@@ -49,7 +49,7 @@ CONF_DIR=/etc/l2tp-exit
 HELPER=/usr/local/sbin/l2tp-exit
 XUI_DIR=/usr/local/x-ui
 ACCESS_FILE=/root/vpn-access.txt
-SCRIPT_VERSION=18
+SCRIPT_VERSION=19
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 log()  { echo -e "${green}==>${plain} $*"; }
@@ -247,17 +247,21 @@ log "Настраиваю IPsec/L2TP клиент до $VPN_SERVER_IP ..."
 [[ -f /etc/xl2tpd/xl2tpd.conf && ! -f /etc/xl2tpd/xl2tpd.conf.orig ]] \
     && cp /etc/xl2tpd/xl2tpd.conf /etc/xl2tpd/xl2tpd.conf.orig
 
-# Хуки pppd: маршрут туннеля в его таблицу (основной и доп. выходы)
+# Хуки pppd: маршрут туннеля в его таблицу (основной и доп. выходы), а для
+# L2TP-клиентов этого сервера — выход по логину (PEERNAME)
 cat > /etc/ppp/ip-up.d/$CONN <<'EOF'
 #!/bin/sh
 case "$PPP_IPPARAM" in
     l2tp-exit*) exec /usr/local/sbin/l2tp-exit ppp-up "$PPP_IPPARAM" "$PPP_IFACE" ;;
+    *) [ -n "$PEERNAME" ] && exec /usr/local/sbin/l2tp-exit client-up "$PPP_IFACE" "$PPP_LOCAL" "$PPP_REMOTE" "$PEERNAME" ;;
 esac
+exit 0
 EOF
 cat > /etc/ppp/ip-down.d/$CONN <<'EOF'
 #!/bin/sh
 case "$PPP_IPPARAM" in
     l2tp-exit*) exec /usr/local/sbin/l2tp-exit ppp-down "$PPP_IPPARAM" "$PPP_IFACE" ;;
+    *) exec /usr/local/sbin/l2tp-exit client-down "$PPP_IFACE" ;;
 esac
 EOF
 chmod 755 /etc/ppp/ip-up.d/$CONN /etc/ppp/ip-down.d/$CONN
@@ -288,6 +292,8 @@ IFACE_FILE=/run/l2tp-exit.iface
 SIG_FILE=/run/l2tp-exit.routes
 MARK_BASE=8192
 EXIT_PORTS="2053 2083 2087 2443 3443 4443 5443 6443 7443"
+USERS_FILE=$CONF_DIR/l2tp-users
+CLIENTS_DIR=/run/l2tp-exit-clients
 . $CONF_DIR/l2tp-exit.env
 
 log() { echo "l2tp-exit: $*"; }
@@ -331,6 +337,11 @@ set_var() {
     printf "%s='%s'\n" "$k" "$v" >> "$f"
 }
 
+# Свежее значение из l2tp-exit.env (watch держит то, что было при старте)
+env_get() {
+    ( . $CONF_DIR/l2tp-exit.env 2>/dev/null; eval "printf '%s' \"\${$1:-}\"" )
+}
+
 # Имя выхода по имени IPsec/L2TP-соединения (для ip-up/ip-down)
 uplink_by_conn() {
     case "$1" in
@@ -349,6 +360,7 @@ uplink_by_conn() {
 #   pref 1001  from <IP на WAN>             -> main (ответы клиентам, SSH, панель)
 #   pref 1002  main без default             -> подсети провайдера, peer ppp и т.д.
 #   pref 1003  fwmark 8192+N                -> 202+N (подключение доп. выхода)
+#   pref 1003  from <IP L2TP-клиента>       -> 202+N (логин привязан к доп. выходу)
 #   pref 1004  всё остальное                -> 202 (основной туннель)
 # В таблице каждого туннеля при KILL_SWITCH=1 стоит unreachable (трафик выхода
 # никуда не уходит), при KILL_SWITCH=0 у доп. выходов — прямой маршрут через
@@ -643,8 +655,6 @@ EOF
         printf '%s' "$lacs"
     } > /etc/xl2tpd/xl2tpd.conf
 
-    touch /etc/ppp/chap-secrets
-    sed -i '/# l2tp-exit-server$/d' /etc/ppp/chap-secrets
     if [ "${L2TP_SERVER:-0}" = "1" ]; then
         cat > /etc/ppp/options.l2tp-server <<EOF
 +mschap-v2
@@ -660,12 +670,179 @@ lcp-echo-failure 4
 lcp-echo-interval 30
 connect-delay 5000
 EOF
-        # Наша строка в chap-secrets помечена комментарием, чужие не трогаем
-        printf '"%s" l2tpd "%s" * # l2tp-exit-server\n' "$L2TP_USER" "$L2TP_PASSWORD" >> /etc/ppp/chap-secrets
     fi
-    chmod 600 /etc/ppp/chap-secrets /etc/swanctl/conf.d/$CONN.conf
+    write_chap
+    chmod 600 /etc/swanctl/conf.d/$CONN.conf
     umask 022
     apply_dns
+}
+
+# chap-secrets: основной логин L2TP-клиентов и логины из l2tp-users. Наши строки
+# помечены комментарием, чужие не трогаем. pppd читает файл при каждом входе,
+# поэтому новые логины работают без перезапуска.
+write_chap() {
+    local l p e
+    touch /etc/ppp/chap-secrets
+    chmod 600 /etc/ppp/chap-secrets
+    sed -i '/# l2tp-exit-server$/d' /etc/ppp/chap-secrets
+    [ "${L2TP_SERVER:-0}" = "1" ] || return 0
+    printf '"%s" l2tpd "%s" * # l2tp-exit-server\n' "$L2TP_USER" "$L2TP_PASSWORD" >> /etc/ppp/chap-secrets
+    [ -f "$USERS_FILE" ] || return 0
+    while read -r l p e; do
+        [ -n "$l" ] && [ -n "$p" ] && [ "$l" != "$L2TP_USER" ] || continue
+        printf '"%s" l2tpd "%s" * # l2tp-exit-server\n' "$l" "$p" >> /etc/ppp/chap-secrets
+    done < "$USERS_FILE"
+}
+
+# ---------------------------------------------------------------- L2TP-клиенты: выход по логину
+#
+# Логины L2TP-клиентов лежат в l2tp-users («логин пароль выход»), основной
+# логин (L2TP_USER) — в l2tp-exit.env, его выход в L2TP_USER_EXIT. Хук ip-up
+# записывает сессию в /run/l2tp-exit-clients/<ppp-интерфейс> («IP логин»),
+# а client_rules_sync держит для каждой сессии правило pref 1003
+# «from <IP клиента> lookup <таблица выхода>». Логины основного выхода правил
+# не требуют: их трафик и так уходит по pref 1004. Несколько устройств под одним
+# логином работают: у каждой сессии свой адрес и своё правило.
+
+# Выход логина; неизвестный логин или удалённый выход — основной
+user_exit() {
+    local e
+    if [ "$1" = "$(env_get L2TP_USER)" ]; then
+        e=$(env_get L2TP_USER_EXIT)
+    else
+        e=$(awk -v u="$1" '$1 == u {print $3; exit}' "$USERS_FILE" 2>/dev/null)
+    fi
+    if [ -n "$e" ] && [ "$e" != main ] && [ -f "$EXITS_DIR/$e.env" ]; then echo "$e"; else echo main; fi
+}
+
+_client_rules_sync() {
+    local f ifc rip login ex want="" have line
+    # Пока маршрутизация не применена (или выключена через down) — правил нет
+    if [ "${L2TP_SERVER:-0}" = "1" ] && ip -4 rule show pref 1004 | grep -q .; then
+        for f in "$CLIENTS_DIR"/ppp*; do
+            [ -f "$f" ] || continue
+            ifc=${f##*/}
+            read -r rip login < "$f"
+            # Сессия закончилась без ip-down (pppd убит) — забываем её
+            if ! ip -4 addr show dev "$ifc" 2>/dev/null | grep -q "peer $rip/"; then
+                rm -f "$f"; continue
+            fi
+            ex=$(user_exit "$login")
+            [ "$ex" = main ] && continue
+            load_uplink "$ex" || continue
+            want="$want$rip $U_TABLE
+"
+        done
+    fi
+    have=$(ip -4 rule show pref 1003 | sed -n 's/^1003:[[:space:]]*from \([0-9.]*\) lookup \([0-9]*\).*/\1 \2/p')
+    printf '%s\n' "$have" | while read -r line; do
+        [ -n "$line" ] || continue
+        printf '%s' "$want" | grep -qxF "$line" || ip -4 rule del pref 1003 from "${line% *}" lookup "${line#* }"
+    done
+    printf '%s' "$want" | while read -r line; do
+        [ -n "$line" ] || continue
+        printf '%s\n' "$have" | grep -qxF "$line" || ip -4 rule add pref 1003 from "${line% *}" lookup "${line#* }"
+    done
+}
+
+# Хуки ip-up/ip-down и цикл watch могут синхронизировать правила одновременно
+client_rules_sync() {
+    ( flock -w 10 9 || exit 0; _client_rules_sync ) 9>/run/l2tp-exit-clients.lock
+}
+
+# client-up <iface> <локальный IP> <IP клиента> <логин> — из /etc/ppp/ip-up.d
+client_up() {
+    local ifc=$1 lip=$2 rip=$3 login=$4
+    [ "${L2TP_SERVER:-0}" = "1" ] && [ "$lip" = "$L2TP_NET.1" ] || return 0
+    printf '%s' "$ifc" | grep -Eq '^ppp[0-9]+$' || return 0
+    printf '%s' "$rip" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || return 0
+    printf '%s' "$login" | grep -Eq '^[A-Za-z0-9._@-]+$' || return 0
+    mkdir -p "$CLIENTS_DIR"
+    echo "$rip $login" > "$CLIENTS_DIR/$ifc"
+    client_rules_sync
+    log "L2TP-клиент $login ($rip, $ifc) → выход $(user_exit "$login")"
+}
+
+client_down() {
+    printf '%s' "${1:-}" | grep -Eq '^ppp[0-9]+$' || return 0
+    [ -f "$CLIENTS_DIR/$1" ] || return 0
+    rm -f "$CLIENTS_DIR/$1"
+    client_rules_sync
+}
+
+# Перезаписать l2tp-users через awk-программу (права 600)
+users_rewrite() {
+    local prog=$1; shift
+    [ -f "$USERS_FILE" ] || return 0
+    ( umask 077; awk "$@" "$prog" "$USERS_FILE" > "$USERS_FILE.tmp" ) && mv "$USERS_FILE.tmp" "$USERS_FILE"
+}
+
+# user-add <логин> <выход> [пароль] — добавить логин или изменить выход/пароль
+user_add() {
+    local login=${1:-} ex=${2:-main} pass=${3:-} old
+    [ "${L2TP_SERVER:-0}" = "1" ] || { log "L2TP-сервер выключен (L2TP_SERVER=0)"; return 1; }
+    printf '%s' "$login" | grep -Eq '^[A-Za-z0-9._@-]{1,32}$' || { log "логин: латиница, цифры и . _ @ -, до 32 символов"; return 1; }
+    [ -z "$pass" ] || printf '%s' "$pass" | grep -Eq '^[A-Za-z0-9._@-]{6,64}$' \
+        || { log "пароль: от 6 символов, латиница, цифры и . _ @ -"; return 1; }
+    [ "$ex" = main ] || [ -f "$EXITS_DIR/$ex.env" ] || { log "нет выхода «${ex}» (см. l2tp-exit exits)"; return 1; }
+    if [ "$login" = "$L2TP_USER" ]; then
+        # Основной логин: меняется только выход, пароль задаётся в entry-server.sh
+        [ -z "$pass" ] || [ "$pass" = "$L2TP_PASSWORD" ] \
+            || { log "пароль основного логина меняется через L2TP_PASSWORD при запуске entry-server.sh"; return 1; }
+        set_var $CONF_DIR/l2tp-exit.env L2TP_USER_EXIT "$ex"
+    else
+        old=$(awk -v u="$login" '$1 == u {print $2; exit}' "$USERS_FILE" 2>/dev/null)
+        [ -n "$pass" ] || pass=$old
+        [ -n "$pass" ] || pass=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 16)
+        ( umask 077; touch "$USERS_FILE" )
+        users_rewrite '$1 != u' -v u="$login"
+        ( umask 077; printf '%s %s %s\n' "$login" "$pass" "$ex" >> "$USERS_FILE" )
+        write_chap
+    fi
+    client_rules_sync
+    load_uplink "$ex"
+    log "логин $login → выход «${ex}» ($U_TITLE)"
+    [ "$login" = "$L2TP_USER" ] || echo "$login $pass $ex"
+}
+
+user_del() {
+    local login=${1:-} f
+    printf '%s' "$login" | grep -Eq '^[A-Za-z0-9._@-]{1,32}$' || { log "нет логина «${login}»"; return 1; }
+    [ "$login" != "$L2TP_USER" ] || { log "основной логин удалить нельзя (L2TP_USER)"; return 1; }
+    awk -v u="$login" '$1 == u {f = 1} END {exit !f}' "$USERS_FILE" 2>/dev/null || { log "нет логина «${login}»"; return 1; }
+    users_rewrite '$1 != u' -v u="$login"
+    write_chap
+    # Активные сессии удалённого логина рвём, иначе они ушли бы в основной выход
+    for f in "$CLIENTS_DIR"/ppp*; do
+        [ -f "$f" ] || continue
+        [ "$(awk '{print $2}' "$f")" = "$login" ] || continue
+        [ -f "/run/${f##*/}.pid" ] && kill "$(head -n1 "/run/${f##*/}.pid")" 2>/dev/null
+    done
+    client_rules_sync
+    log "логин $login удалён"
+}
+
+users() {
+    local l p e
+    [ "${L2TP_SERVER:-0}" = "1" ] || { echo "L2TP-сервер выключен"; return 0; }
+    e=$(user_exit "$L2TP_USER"); load_uplink "$e"
+    echo "$L2TP_USER  (основной логин)  →  $e ($U_TITLE)"
+    [ -f "$USERS_FILE" ] || return 0
+    while read -r l p e; do
+        [ -n "$l" ] || continue
+        e=$(user_exit "$l"); load_uplink "$e"
+        echo "$l  $p  →  $e ($U_TITLE)"
+    done < "$USERS_FILE"
+}
+
+clients() {
+    local f rip login
+    for f in "$CLIENTS_DIR"/ppp*; do
+        [ -f "$f" ] || continue
+        read -r rip login < "$f"
+        ip link show "${f##*/}" >/dev/null 2>&1 || continue
+        echo "${f##*/}  $rip  $login  →  $(user_exit "$login")"
+    done
 }
 
 # ---------------------------------------------------------------- туннели
@@ -711,6 +888,7 @@ watch() {
     rm -f /run/l2tp-exit-connect.*.pid
     while :; do
         apply_routes
+        client_rules_sync
         apply_fw
         for u in $(uplinks); do
             is_up "$u" && { rm -f "/run/l2tp-exit-fails.$u"; continue; }
@@ -1031,6 +1209,9 @@ exit_del() {
         [ -n "$ib" ] && xui_api POST "/panel/api/inbounds/del/$(echo "$ib" | jq -r .id)" >/dev/null
     fi
     rm -f "$EXITS_DIR/$1.env" "/etc/ppp/options.$U_CONN" "$U_IFACE_FILE"
+    # L2TP-логины этого выхода переходят на основной
+    users_rewrite '{ if ($3 == x) $3 = "main"; print }' -v x="$1"
+    [ "$(env_get L2TP_USER_EXIT)" = "$1" ] && set_var $CONF_DIR/l2tp-exit.env L2TP_USER_EXIT main
     ip route flush table "$U_TABLE" 2>/dev/null
     apply_all
     xray_sync
@@ -1055,6 +1236,7 @@ status() {
     echo "=== правила"; ip -4 rule show | grep -E '^(999|100[0-4]):'
     if [ "${L2TP_SERVER:-0}" = "1" ]; then
         echo "=== L2TP-клиенты"; swanctl --list-sas --ike l2tp-server 2>/dev/null | grep -E '^l2tp-server' || echo "нет"
+        echo "=== L2TP-сессии (логин → выход)"; clients
     fi
 }
 
@@ -1077,7 +1259,7 @@ status_json() {
 }
 
 case "${1:-}" in
-    routes) apply_routes; apply_fw ;;
+    routes) apply_routes; client_rules_sync; apply_fw ;;
     apply-config) apply_config ;;
     apply) apply_all ;;
     apply-dns) apply_dns ;;
@@ -1099,6 +1281,12 @@ case "${1:-}" in
         rm -f "$U_IFACE_FILE"
         ip route del default dev "$3" metric 50 table "$U_TABLE" 2>/dev/null
         ;;
+    client-up) client_up "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+    client-down) client_down "${2:-}" ;;
+    users) users ;;
+    user-add) shift; user_add "$@" ;;
+    user-del) user_del "${2:-}" ;;
+    clients) clients ;;
     exits) for u in $(exit_names); do load_uplink "$u"; echo "$u  $U_TITLE  $U_IP  порт $U_PORT"; done ;;
     exit-add) shift; exit_add "$@" ;;
     exit-del) exit_del "${2:-}" ;;
@@ -1112,7 +1300,7 @@ case "${1:-}" in
         remove_fw
         log "туннели остановлены, маршрутизация возвращена к исходной"
         ;;
-    *) echo "usage: $0 {status|down|reconnect|apply|exits|exit-add|exit-del|xray-sync|links|routes|watch}"; exit 1 ;;
+    *) echo "usage: $0 {status|down|reconnect|apply|exits|exit-add|exit-del|users|user-add|user-del|clients|xray-sync|links|routes|watch}"; exit 1 ;;
 esac
 HELPER_EOF
 chmod 755 $HELPER
@@ -1134,6 +1322,7 @@ L2TP_NET='$L2TP_NET'
 L2TP_PSK='$L2TP_PSK'
 L2TP_USER='$L2TP_USER'
 L2TP_PASSWORD='$L2TP_PASSWORD'
+L2TP_USER_EXIT='$(saved L2TP_USER_EXIT)'
 MAIN_INBOUND_REMARK='$INBOUND_REMARK'
 MAIN_INBOUND_ID='$(saved MAIN_INBOUND_ID)'
 MAIN_TITLE='$MAIN_TITLE'
@@ -1554,6 +1743,9 @@ if [[ -n $(ls $CONF_DIR/exits.d/*.env 2>/dev/null) ]]; then
     EXIT_LINKS=$($HELPER links 2>/dev/null) || EXIT_LINKS=""
 fi
 
+L2TP_USERS=""
+[[ $L2TP_SERVER == 1 ]] && { L2TP_USERS=$($HELPER users 2>/dev/null) || L2TP_USERS=""; }
+
 PANEL_URL="$scheme://${PANEL_HOST:-$PUBLIC_IP}:$XUI_PANEL_PORT/$XUI_WEB_BASE_PATH/"
 
 # ---------------------------------------------------------------------------
@@ -1592,6 +1784,9 @@ ENV_FILE = '/etc/l2tp-exit/l2tp-exit.env'
 HELPER = '/usr/local/sbin/l2tp-exit'
 IFACE_FILE = '/run/l2tp-exit.iface'
 EXITS_DIR = '/etc/l2tp-exit/exits.d'
+USERS_FILE = '/etc/l2tp-exit/l2tp-users'
+CLIENTS_DIR = '/run/l2tp-exit-clients'
+LOGIN_RE = re.compile(r'^[A-Za-z0-9._@-]{1,32}$')
 PAM_SERVICE = 'l2tp-exit-web'
 ALLOWED_USER = 'root'
 SESSION_TTL = 12 * 3600
@@ -1737,6 +1932,39 @@ def read_exits():
                       'port': d.get('PORT', '')})
     return exits
 
+
+def read_users():
+    users = []
+    try:
+        with open(USERS_FILE) as f:
+            for line in f:
+                p = line.split()
+                if len(p) == 3:
+                    users.append({'login': p[0], 'password': p[1], 'exit': p[2]})
+    except OSError:
+        pass
+    return users
+
+
+def active_sessions():
+    # Сессии L2TP-клиентов по логинам (их записывает хук ip-up)
+    counts = {}
+    try:
+        names = os.listdir(CLIENTS_DIR)
+    except OSError:
+        return counts
+    for n in names:
+        if not os.path.exists('/sys/class/net/' + n):
+            continue
+        try:
+            with open(os.path.join(CLIENTS_DIR, n)) as f:
+                p = f.read().split()
+        except OSError:
+            continue
+        if len(p) == 2:
+            counts[p[1]] = counts.get(p[1], 0) + 1
+    return counts
+
 # --------------------------------------------------------------------- sessions
 
 _sessions = {}   # token -> {'exp': ts, 'csrf': str}
@@ -1788,6 +2016,9 @@ MESSAGES = {
     'csrf': ('err', 'Сессия устарела, обновите страницу.'),
     'exit_added': ('ok', 'Выход сохранён. Туннели переподключаются, это займёт до минуты. Ссылки — в «Ссылках для подключения» или в подписке.'),
     'exit_deleted': ('ok', 'Выход удалён.'),
+    'user_saved': ('ok', 'Логин сохранён. Новый выход действует сразу, в том числе для уже подключённых устройств (для новых соединений).'),
+    'user_deleted': ('ok', 'Логин удалён, его подключения разорваны.'),
+    'bad_user': ('err', 'Логин: латиница, цифры и . _ @ -, до 32 символов. Пароль: от 6 символов из тех же знаков или пусто.'),
     'bad_exit': ('err', 'Имя выхода — латиница и цифры, до 12 символов, начинается с буквы (например de, in). В названии не должно быть кавычек.'),
 }
 
@@ -1805,7 +2036,7 @@ h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:0 0 12px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
 .k{color:var(--muted);font-size:13px}.v{font-weight:600}
 label{display:block;margin:10px 0 4px;font-size:14px}
-input[type=text],input[type=password]{width:100%;padding:9px 10px;border:1px solid var(--line);
+input[type=text],input[type=password],select{width:100%;padding:9px 10px;border:1px solid var(--line);
 border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
 .opt{display:flex;gap:10px;align-items:flex-start;margin:10px 0}.opt input{margin-top:4px}
 .hint{color:var(--muted);font-size:13px;margin:4px 0 0}
@@ -1862,6 +2093,35 @@ onsubmit="return confirm('Удалить выход {html.escape(x["title"])}? �
                    for x in exits)
     ks = env.get('KILL_SWITCH', '1') == '1'
     set_dns = env.get('SET_DNS', '1') == '1'
+    users_card = ''
+    if env.get('L2TP_SERVER') == '1':
+        titles = {'main': env.get('MAIN_TITLE', 'Основной')}
+        titles.update({x['name']: x['title'] for x in exits})
+        exit_title = lambda n: titles.get(n, titles['main'])
+        sess_count = active_sessions()
+        main_login = env.get('L2TP_USER', '')
+        main_exit = env.get('L2TP_USER_EXIT') or 'main'
+        urows = f'''<tr><td><b>{html.escape(main_login)}</b><div class="hint">основной логин</div></td>
+<td>{html.escape(exit_title(main_exit))}</td><td class="hint">из установки</td>
+<td>{sess_count.get(main_login, 0)}</td><td></td></tr>'''
+        for u in read_users():
+            urows += f'''<tr><td><b>{html.escape(u["login"])}</b></td><td>{html.escape(exit_title(u["exit"]))}</td>
+<td><code>{html.escape(u["password"])}</code></td><td>{sess_count.get(u["login"], 0)}</td>
+<td><form method="post" action="/user-del" onsubmit="return confirm('Удалить логин {html.escape(u["login"])}? Его подключения будут разорваны.')">{csrf}
+<input type="hidden" name="login" value="{html.escape(u["login"])}"><button class="ghost" type="submit" title="Удалить логин" aria-label="Удалить логин">✕</button></form></td></tr>'''
+        opts = ''.join(f'<option value="{html.escape(n)}">{html.escape(t)}</option>' for n, t in titles.items())
+        users_card = f'''<section class="card"><h2>L2TP: выход по логину</h2>
+<p class="hint">Сервер и PSK у всех логинов одни и те же. Выход определяется логином, под которым подключилось устройство.</p>
+<div class="tbl"><table><thead><tr><th>Логин</th><th>Выход</th><th>Пароль</th><th>Сессий</th><th></th></tr></thead>
+<tbody>{urows}</tbody></table></div>
+<form method="post" action="/user-add">{csrf}<div class="row2">
+<div><label for="ul">Логин</label><input type="text" id="ul" name="login" placeholder="de" required pattern="[A-Za-z0-9._@\\-]{{1,32}}"></div>
+<div><label for="ux">Выход</label><select id="ux" name="exit">{opts}</select></div>
+<div><label for="up">Пароль</label><input type="text" id="up" name="password" placeholder="пусто — случайный / не менять" autocomplete="off"></div>
+</div>
+<p class="hint">Существующий логин — это изменение: можно сменить выход, пароль останется прежним, если поле пустое.
+У основного логина меняется только выход.</p>
+<button type="submit">Сохранить логин</button></form></section>'''
     return page('Туннель — сервер №1', f'''
 <div class="top"><div><h1>Управление туннелем</h1>
 <p class="sub">Сервер №1 · выходов: {1 + len(exits)}</p></div>
@@ -1872,7 +2132,7 @@ onsubmit="return confirm('Удалить выход {html.escape(x["title"])}? �
 <tr data-n="main"><td><b>{e("MAIN_TITLE", "Основной")}</b><div class="hint">основной · {e("VPN_SERVER_IP")}</div></td>
 <td class="t">…</td><td class="ip">…</td><td></td></tr>
 {rows}</tbody></table></div>
-<p class="hint">Через основной выход идут трафик самого сервера, L2TP-клиенты и основное подключение VLESS.
+<p class="hint">Через основной выход идут трафик самого сервера, L2TP-клиенты (если их логин не привязан к другому выходу) и основное подключение VLESS.
 Каждый дополнительный выход — отдельное подключение VLESS на своём порту. L2TP-клиентов сейчас: <b id="st-l2tp">…</b></p>
 <div style="display:flex;gap:10px;flex-wrap:wrap">
 <form method="post" action="/reconnect">{csrf}<button class="ghost" type="submit">Переподключить туннели</button></form>
@@ -1894,6 +2154,8 @@ onsubmit="return confirm('Удалить выход {html.escape(x["title"])}? �
 в той же подписке. Если порт закрыт файрволом провайдера, откройте его. При добавлении туннели и L2TP-клиенты
 переподключаются (до минуты). Существующее имя — это изменение выхода, порт при этом сохраняется.</p>
 <button type="submit">Добавить</button></form>
+
+{users_card}
 
 <form class="card" method="post" action="/uplink">{csrf}<h2>Основной выход (сервер №2)</h2>
 <label for="ip">IP-адрес</label><input type="text" id="ip" name="ip" value="{e("VPN_SERVER_IP")}" required>
@@ -2089,6 +2351,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._redirect('/?m=' + self.save_dns(form))
         if path == '/exit-add':
             return self._redirect('/?m=' + self.exit_add(form, sess))
+        if path == '/user-add':
+            login = form.get('login', '').strip()
+            ex = form.get('exit', 'main')
+            pw = form.get('password', '').strip()
+            if not LOGIN_RE.match(login) or not re.match(r'^[a-z][a-z0-9]{0,11}$', ex) \
+                    or (pw and not re.match(r'^[A-Za-z0-9._@-]{6,64}$', pw)):
+                return self._redirect('/?m=bad_user')
+            rc, out = run([HELPER, 'user-add', login, ex] + ([pw] if pw else []), 30)
+            if rc != 0:
+                sess['flash'] = ('err', helper_error(out))
+                return self._redirect('/')
+            return self._redirect('/?m=user_saved')
+        if path == '/user-del':
+            login = form.get('login', '')
+            if not LOGIN_RE.match(login):
+                return self._redirect('/?m=bad_user')
+            rc, out = run([HELPER, 'user-del', login], 30)
+            if rc != 0:
+                sess['flash'] = ('err', helper_error(out))
+                return self._redirect('/')
+            return self._redirect('/?m=user_deleted')
         if path == '/exit-del':
             name = form.get('name', '')
             if not re.match(r'^[a-z][a-z0-9]{0,11}$', name):
@@ -2296,6 +2579,10 @@ summary() {
         echo "  Пароль   : $L2TP_PASSWORD"
         echo "  (Android 12+ не умеет L2TP — для него ссылка VLESS выше. Windows за NAT:"
         echo "   нужен ключ реестра AssumeUDPEncapsulationContextOnSendRule=2, см. README)"
+        if [[ -n $L2TP_USERS ]]; then
+            echo "  Логины и выходы (тот же сервер и PSK; l2tp-exit user-add/user-del):"
+            while read -r l; do echo "    $l"; done <<<"$L2TP_USERS"
+        fi
         echo
     fi
     if [[ -n $WEBUI_URL ]]; then
